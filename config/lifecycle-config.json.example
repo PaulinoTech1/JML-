@@ -1,0 +1,1 @@
+{"_comment":"EXAMPLE ONLY. Copy to lifecycle-config.json and fill in your tenant values. Never commit the real file.","domain":"contoso.com","notes":"usageLocation must be a valid ISO 3166-1 alpha-2 code; it is required before license assignment.","tenantId":"00000000-0000-0000-0000-000000000000","upnPattern":"{first}.{last}","usageLocation":"US"}

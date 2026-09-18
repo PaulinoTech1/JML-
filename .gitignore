@@ -1,0 +1,4 @@
+logs/
+reports/
+config/lifecycle-config.json
+config/role-mappings.json
