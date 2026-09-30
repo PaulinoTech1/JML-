@@ -43,12 +43,16 @@ Import-Module (Join-Path $PSScriptRoot 'modules' 'IdentityLifecycle.Common.psm1'
 Import-Module Microsoft.Graph.Users -ErrorAction Stop
 Import-Module Microsoft.Graph.Groups -ErrorAction Stop
 
+# Least-privilege scopes for the mover's job only (interactive/delegated mode).
+# App-only permissions come from the app registration; see docs/APP_REGISTRATION.md.
+$moverScopes = @('User.ReadWrite.All', 'GroupMember.ReadWrite.All', 'Directory.Read.All', 'Organization.Read.All')
+
 Set-LifecycleMode -Apply $Apply.IsPresent
 $run = Initialize-LifecycleRun -ScriptName 'Mover-UpdateEmployee' -LogDirectory $LogDirectory
 Write-Host ("Run {0} | dryRun={1} | audit: {2}" -f $run.RunId, $run.DryRun, $run.AuditLogPath) -ForegroundColor Cyan
 
 try {
-    if ($Interactive) { Connect-LifecycleGraph -Interactive } else { Connect-LifecycleGraph }
+    if ($Interactive) { Connect-LifecycleGraph -Interactive -Scopes $moverScopes } else { Connect-LifecycleGraph -Scopes $moverScopes }
 
     $null = Get-LifecycleConfig -Path $ConfigPath  # validated; fail-closed on bad config
     $mapping = Get-RoleMapping -Path $RoleMapPath -Department $NewDepartment
@@ -57,28 +61,35 @@ try {
     $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f $UserPrincipalName) -ErrorAction Stop
     if (-not $user) { throw "User '$UserPrincipalName' not found." }
 
-    # --- Group reconciliation ---
+    # --- Group reconciliation (by immutable object ID, never display name) ---
     $memberOf = Get-MgUserMemberOf -UserId $user.Id -All -ErrorAction Stop
     $currentGroups = @($memberOf | Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.group' } |
-        ForEach-Object { $_.AdditionalProperties['displayName'] } | Where-Object { $_ })
+        ForEach-Object { $_.Id } | Where-Object { $_ })
 
-    $groupPlan = Compare-MembershipPlan -Current $currentGroups -Target $mapping['groups'] -ManagedUniverse $managedUniverse
+    # Config names are labels for humans; IDs are authoritative.
+    $groupNameOf = @{}
+    foreach ($entry in $mapping['groups']) { $groupNameOf[$entry['id']] = $entry['name'] }
+    $targetGroups = @($groupNameOf.Keys)
+
+    $groupPlan = Compare-MembershipPlan -Current $currentGroups -Target $targetGroups -ManagedUniverse $managedUniverse
     Write-Host ("Groups: +{0} add, -{1} remove, ={2} keep" -f $groupPlan.Add.Count, $groupPlan.Remove.Count, $groupPlan.Keep.Count)
 
-    foreach ($groupName in $groupPlan.Add) {
-        $group = Get-MgGroup -Filter ("displayName eq '{0}'" -f $groupName) -ErrorAction Stop
+    foreach ($groupId in $groupPlan.Add) {
+        $group = Get-MgGroup -GroupId $groupId -ErrorAction Stop
         if (-not $group) {
-            Write-Warning "Group '$groupName' not found in tenant. Skipped."
+            Write-Warning ("Group ID '{0}' not found in tenant. Skipped." -f $groupId)
             continue
         }
-        Invoke-LifecycleStep -Action 'GroupMember.Add' -Target "$UserPrincipalName -> $($group.DisplayName)" -ScriptBlock {
+        $label = if ($groupNameOf.ContainsKey($groupId)) { $groupNameOf[$groupId] } else { $groupId }
+        Invoke-LifecycleStep -Action 'GroupMember.Add' -Target "$UserPrincipalName -> $label" -ScriptBlock {
             New-MgGroupMember -GroupId $group.Id -DirectoryObjectId $user.Id
         } | Out-Null
     }
-    foreach ($groupName in $groupPlan.Remove) {
-        $group = Get-MgGroup -Filter ("displayName eq '{0}'" -f $groupName) -ErrorAction Stop
+    foreach ($groupId in $groupPlan.Remove) {
+        $group = Get-MgGroup -GroupId $groupId -ErrorAction Stop
         if (-not $group) { continue }
-        Invoke-LifecycleStep -Action 'GroupMember.Remove' -Target "$UserPrincipalName -> $($group.DisplayName)" `
+        $label = if ($groupNameOf.ContainsKey($groupId)) { $groupNameOf[$groupId] } else { $groupId }
+        Invoke-LifecycleStep -Action 'GroupMember.Remove' -Target "$UserPrincipalName -> $label" `
             -Detail 'Removed: in managed universe, not in target role mapping.' -ScriptBlock {
                 Remove-MgGroupMemberByRef -GroupId $group.Id -DirectoryObjectId $user.Id
             } | Out-Null

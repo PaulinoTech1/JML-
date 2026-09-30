@@ -50,13 +50,16 @@ try {
     else {
         Connect-LifecycleGraph -Scopes @('User.Read.All', 'Directory.Read.All', 'RoleManagement.Read.Directory', 'AuditLog.Read.All')
     }
-    $null = Get-LifecycleConfig -Path $ConfigPath
+    $config = Get-LifecycleConfig -Path $ConfigPath  # validated; fail-closed on bad config
 
     $cutoff = (Get-Date).AddDays(-$StaleDays)
 
     # --- 1. Stale accounts ---
     Write-Host 'Checking for stale accounts...' -ForegroundColor Cyan
     $users = Get-MgUser -All -Property 'id,userPrincipalName,displayName,accountEnabled,createdDateTime,signInActivity,userType' -ErrorAction Stop
+    # Tenant-wide reads are not paged beyond the Graph SDK defaults.
+    # Fail closed on tenants larger than designed rather than mis-reporting.
+    Assert-TenantSize -UserCount $users.Count -MaxUsers $config.maxTenantUsers
     $stale = @($users | Where-Object {
         $_.UserType -eq 'Member' -and $_.AccountEnabled -and
         ($null -eq $_.SignInActivity.LastSignInDateTime -or $_.SignInActivity.LastSignInDateTime -lt $cutoff)

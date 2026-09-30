@@ -9,8 +9,9 @@
       - DRY-RUN BY DEFAULT. Without -Apply nothing is touched.
       - With -Apply, a TYPED confirmation is required
         ("DISABLE user@domain"). -Force skips the prompt for scheduled runs,
-        but -Force is intended for automation with an approved change record,
-        not for casual use.
+        but -Force REQUIRES -ChangeTicket with the approved change record
+        reference, which is written to the audit log. -Force without a ticket
+        fails closed.
       - Order of operations is deliberate and documented below.
 
     Order of operations:
@@ -19,17 +20,22 @@
       3. Remove all direct group memberships.
       4. Remove all licenses.
       5. Stamp employeeLeaveDateTime.
-      6. Optionally wipe enrolled mobile devices (-IncludeDevices).
 
     Mailbox handling is intentionally OUT OF SCOPE for the Graph-only core:
     converting to a shared mailbox or setting forwarding requires Exchange
     Online. See docs/RUNBOOK.md for the manual step.
+
+    Device wipes are intentionally OUT OF SCOPE: wiping enrolled devices is
+    an Intune action with its own permission boundary, not a lifecycle step.
 .EXAMPLE
     # Dry run: show the full offboarding plan
     ./Leaver-OffboardEmployee.ps1 -UserPrincipalName 'ada.lovelace@contoso.com' -Interactive
 .EXAMPLE
     # Live with typed confirmation
     ./Leaver-OffboardEmployee.ps1 -UserPrincipalName 'ada.lovelace@contoso.com' -Apply
+.EXAMPLE
+    # Scheduled run: -Force requires the approved change record reference
+    ./Leaver-OffboardEmployee.ps1 -UserPrincipalName 'ada.lovelace@contoso.com' -Apply -Force -ChangeTicket 'CHG-1234'
 #>
 
 [CmdletBinding()]
@@ -39,9 +45,9 @@ param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..' 'config' 'lifecycle-config.json'),
     [string]$LogDirectory = (Join-Path $PSScriptRoot '..' 'logs'),
     [switch]$Interactive,
-    [switch]$IncludeDevices,
     [switch]$Apply,
-    [switch]$Force
+    [switch]$Force,
+    [string]$ChangeTicket = ''
 )
 
 Set-StrictMode -Version Latest
@@ -51,9 +57,20 @@ Import-Module (Join-Path $PSScriptRoot 'modules' 'IdentityLifecycle.Common.psm1'
 Import-Module Microsoft.Graph.Users -ErrorAction Stop
 Import-Module Microsoft.Graph.Groups -ErrorAction Stop
 
+# Least-privilege scopes for the leaver's job only (interactive/delegated mode).
+# App-only permissions come from the app registration; see docs/APP_REGISTRATION.md.
+$leaverScopes = @('User.ReadWrite.All', 'GroupMember.ReadWrite.All', 'Directory.Read.All')
+
 Set-LifecycleMode -Apply $Apply.IsPresent
 $run = Initialize-LifecycleRun -ScriptName 'Leaver-OffboardEmployee' -LogDirectory $LogDirectory
 Write-Host ("Run {0} | dryRun={1} | audit: {2}" -f $run.RunId, $run.DryRun, $run.AuditLogPath) -ForegroundColor Cyan
+
+# Authorization gate: unattended offboarding requires a change record.
+Assert-LeaverForceAuthorization -Force $Force.IsPresent -ChangeTicket $ChangeTicket
+if ($Force.IsPresent) {
+    Write-LifecycleAudit -Action 'Leaver.ForceAuthorization' -Target $UserPrincipalName -Result 'Executed' `
+        -Detail ("changeTicket={0}" -f $ChangeTicket) | Out-Null
+}
 
 if ($Apply.IsPresent -and -not $Force.IsPresent) {
     $expected = "DISABLE $UserPrincipalName"
@@ -67,7 +84,7 @@ if ($Apply.IsPresent -and -not $Force.IsPresent) {
 }
 
 try {
-    if ($Interactive) { Connect-LifecycleGraph -Interactive } else { Connect-LifecycleGraph }
+    if ($Interactive) { Connect-LifecycleGraph -Interactive -Scopes $leaverScopes } else { Connect-LifecycleGraph -Scopes $leaverScopes }
     $null = Get-LifecycleConfig -Path $ConfigPath  # validated for fail-closed behavior
 
     $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f $UserPrincipalName) -ErrorAction Stop
@@ -119,18 +136,6 @@ try {
         -Detail ("employeeLeaveDateTime={0:yyyy-MM-dd}" -f $LastDay) -ScriptBlock {
             Update-MgUser -UserId $user.Id -EmployeeLeaveDateTime $LastDay.ToUniversalTime().ToString('o')
         } | Out-Null
-
-    # --- 6. Optional: wipe enrolled mobile devices ---
-    if ($IncludeDevices) {
-        Import-Module Microsoft.Graph.DeviceManagement -ErrorAction Stop
-        $devices = Get-MgUserManagedDevice -UserId $user.Id -All -ErrorAction Stop
-        Write-Host ("Wiping {0} enrolled devices." -f $devices.Count) -ForegroundColor Red
-        foreach ($device in $devices) {
-            Invoke-LifecycleStep -Action 'Device.Wipe' -Target ("{0} ({1})" -f $device.DeviceName, $device.Id) -ScriptBlock {
-                Invoke-MgWipeUserManagedDevice -UserId $user.Id -ManagedDeviceId $device.Id
-            } | Out-Null
-        }
-    }
 
     Write-Host ("Done. Audit log: {0}" -f $run.AuditLogPath) -ForegroundColor Cyan
     Write-Host 'Follow docs/RUNBOOK.md for the mailbox step (shared mailbox conversion / forwarding via Exchange Online).' -ForegroundColor Yellow

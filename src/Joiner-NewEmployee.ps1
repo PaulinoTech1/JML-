@@ -46,12 +46,16 @@ Import-Module (Join-Path $PSScriptRoot 'modules' 'IdentityLifecycle.Common.psm1'
 Import-Module Microsoft.Graph.Users -ErrorAction Stop
 Import-Module Microsoft.Graph.Groups -ErrorAction Stop
 
+# Least-privilege scopes for the joiner's job only (interactive/delegated mode).
+# App-only permissions come from the app registration; see docs/APP_REGISTRATION.md.
+$joinerScopes = @('User.ReadWrite.All', 'GroupMember.ReadWrite.All', 'Directory.Read.All', 'Organization.Read.All')
+
 Set-LifecycleMode -Apply $Apply.IsPresent
 $run = Initialize-LifecycleRun -ScriptName 'Joiner-NewEmployee' -LogDirectory $LogDirectory
 Write-Host ("Run {0} | dryRun={1} | audit: {2}" -f $run.RunId, $run.DryRun, $run.AuditLogPath) -ForegroundColor Cyan
 
 try {
-    if ($Interactive) { Connect-LifecycleGraph -Interactive } else { Connect-LifecycleGraph }
+    if ($Interactive) { Connect-LifecycleGraph -Interactive -Scopes $joinerScopes } else { Connect-LifecycleGraph -Scopes $joinerScopes }
 
     $config  = Get-LifecycleConfig -Path $ConfigPath
     $mapping = Get-RoleMapping -Path $RoleMapPath -Department $Department
@@ -88,13 +92,17 @@ try {
     # dry-run mode there is no object, so resolve group/license targets by name.
     if ($newUser) { $targetUserId = $newUser.Id } else { $targetUserId = $null }
 
-    # --- 2. Group memberships from the role mapping ---
-    foreach ($groupName in $mapping['groups']) {
-        $group = Get-MgGroup -Filter ("displayName eq '{0}'" -f $groupName) -ErrorAction Stop
+    # --- 2. Group memberships from the role mapping (resolved by immutable ID) ---
+    foreach ($entry in $mapping['groups']) {
+        $group = Get-MgGroup -GroupId $entry['id'] -ErrorAction Stop
         if (-not $group) {
-            Write-LifecycleAudit -Action 'GroupMember.Add' -Target "$upn -> $groupName" -Result 'Failed' -Detail 'Group not found in tenant.' | Out-Null
-            Write-Warning "Group '$groupName' not found in tenant. Skipped."
+            Write-LifecycleAudit -Action 'GroupMember.Add' -Target "$upn -> $($entry['name'])" -Result 'Failed' `
+                -Detail ("Group ID not found in tenant: {0}" -f $entry['id']) | Out-Null
+            Write-Warning ("Group ID '{0}' (config name '{1}') not found in tenant. Skipped." -f $entry['id'], $entry['name'])
             continue
+        }
+        if ($group.DisplayName -ne $entry['name']) {
+            Write-Warning ("Group {0} is named '{1}' in the tenant but '{2}' in config. The object ID is authoritative; update the config name." -f $entry['id'], $group.DisplayName, $entry['name'])
         }
         Invoke-LifecycleStep -Action 'GroupMember.Add' -Target "$upn -> $($group.DisplayName)" -ScriptBlock {
             New-MgGroupMember -GroupId $group.Id -DirectoryObjectId $targetUserId

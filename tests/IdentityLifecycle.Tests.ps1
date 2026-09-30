@@ -87,31 +87,94 @@ Describe 'Get-LifecycleConfig' {
     It 'fails closed when the file does not exist' {
         { Get-LifecycleConfig -Path (Join-Path $testRoot 'nope.json') } | Should -Throw '*not found*'
     }
+
+    It 'defaults maxTenantUsers to 5000 when absent' {
+        $path = Join-Path $testRoot 'config-notenant.json'
+        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
+        $config = Get-LifecycleConfig -Path $path
+        $config.maxTenantUsers | Should -Be 5000
+    }
+
+    It 'rejects a non-positive maxTenantUsers' {
+        $path = Join-Path $testRoot 'config-badtenant.json'
+        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","maxTenantUsers":0}' | Set-Content -Path $path -Encoding utf8
+        { Get-LifecycleConfig -Path $path } | Should -Throw '*maxTenantUsers*'
+    }
 }
 
 Describe 'Get-RoleMapping' {
     BeforeAll {
         $mapPath = Join-Path $testRoot 'roles.json'
-        '{"IT":{"groups":["sg-it"],"licenses":["SPB"]},"Sales":{"groups":[],"licenses":[]}}' |
+        '{"IT":{"groups":[{"id":"11111111-1111-1111-1111-111111111111","name":"sg-it"}],"licenses":["SPB"]},"Sales":{"groups":[],"licenses":[]}}' |
             Set-Content -Path $mapPath -Encoding utf8
     }
 
     It 'returns the mapping for a known department' {
         $mapping = Get-RoleMapping -Path $mapPath -Department 'IT'
-        $mapping['groups'] | Should -Be @('sg-it')
+        $mapping['groups'][0]['id'] | Should -Be '11111111-1111-1111-1111-111111111111'
+        $mapping['groups'][0]['name'] | Should -Be 'sg-it'
     }
 
     It 'fails closed on an unknown department and lists valid ones' {
         { Get-RoleMapping -Path $mapPath -Department 'Narnia' } | Should -Throw '*Valid departments*'
     }
+
+    It 'fails closed on legacy display-name group entries with migration guidance' {
+        $legacyPath = Join-Path $testRoot 'roles-legacy.json'
+        '{"IT":{"groups":["sg-it"],"licenses":[]}}' | Set-Content -Path $legacyPath -Encoding utf8
+        { Get-RoleMapping -Path $legacyPath -Department 'IT' } | Should -Throw '*object ID*'
+    }
+
+    It 'fails closed when a group entry is missing the id' {
+        $badPath = Join-Path $testRoot 'roles-noid.json'
+        '{"IT":{"groups":[{"name":"sg-it"}],"licenses":[]}}' | Set-Content -Path $badPath -Encoding utf8
+        { Get-RoleMapping -Path $badPath -Department 'IT' } | Should -Throw '*id*'
+    }
 }
 
 Describe 'Get-ManagedGroupUniverse' {
-    It 'unions groups across all departments' {
+    It 'unions group IDs across all departments' {
         $mapPath = Join-Path $testRoot 'roles.json'
         $universe = Get-ManagedGroupUniverse -Path $mapPath
-        $universe | Should -Contain 'sg-it'
+        $universe | Should -Contain '11111111-1111-1111-1111-111111111111'
         $universe.Count | Should -Be 1
+    }
+
+    It 'ignores underscore-prefixed metadata keys' {
+        $metaPath = Join-Path $testRoot 'roles-meta.json'
+        '{"_comment":"example","IT":{"groups":[{"id":"22222222-2222-2222-2222-222222222222","name":"sg-it"}],"licenses":[]}}' |
+            Set-Content -Path $metaPath -Encoding utf8
+        $universe = Get-ManagedGroupUniverse -Path $metaPath
+        $universe | Should -Contain '22222222-2222-2222-2222-222222222222'
+        $universe.Count | Should -Be 1
+    }
+}
+
+Describe 'Assert-LeaverForceAuthorization' {
+    It 'throws when -Force is used without a change ticket' {
+        { Assert-LeaverForceAuthorization -Force $true -ChangeTicket '' } | Should -Throw '*ChangeTicket*'
+    }
+
+    It 'passes when -Force is paired with a change ticket' {
+        { Assert-LeaverForceAuthorization -Force $true -ChangeTicket 'CHG-1234' } | Should -Not -Throw
+    }
+
+    It 'passes when -Force is not used' {
+        { Assert-LeaverForceAuthorization -Force $false -ChangeTicket '' } | Should -Not -Throw
+    }
+}
+
+Describe 'Assert-TenantSize' {
+    It 'throws when the tenant exceeds the designed limit' {
+        { Assert-TenantSize -UserCount 5001 -MaxUsers 5000 } | Should -Throw '*designed limit*'
+    }
+
+    It 'passes at exactly the limit' {
+        { Assert-TenantSize -UserCount 5000 -MaxUsers 5000 } | Should -Not -Throw
+    }
+
+    It 'passes below the limit' {
+        { Assert-TenantSize -UserCount 42 -MaxUsers 5000 } | Should -Not -Throw
     }
 }
 

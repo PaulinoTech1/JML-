@@ -149,6 +149,9 @@ function Connect-LifecycleGraph {
           3. Interactive delegated sign-in (-Interactive), for testing only.
         Tenant ID comes from -TenantId or LIFECYCLE_TENANT_ID.
         Client (app) ID comes from -ClientId or LIFECYCLE_CLIENT_ID.
+        Certificate auth is strongly preferred: a client secret lives in
+        process memory and can leak into shell history if exported
+        interactively. See docs/APP_REGISTRATION.md.
     #>
     [CmdletBinding(DefaultParameterSetName = 'AppSecret')]
     param(
@@ -184,6 +187,7 @@ function Connect-LifecycleGraph {
             if ($null -eq $ClientSecret -or $ClientSecret.Length -eq 0) {
                 throw 'Client secret missing. Set LIFECYCLE_CLIENT_SECRET env var or use -Interactive / certificate auth.'
             }
+            Write-Warning 'Client-secret auth in use. Prefer certificate auth (LIFECYCLE_CERT_THUMBPRINT); see docs/APP_REGISTRATION.md.'
             $credential = [pscredential]::new($ClientId, $ClientSecret)
             Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential -NoWelcome
         }
@@ -213,6 +217,15 @@ function Get-LifecycleConfig {
             throw ("Config validation failed: required field '{0}' is missing or empty in {1}." -f $field, $Path)
         }
     }
+    # Tenant-size boundary. This tool is sized for small-business tenants;
+    # tenant-wide reads are not paged beyond the Graph SDK defaults, so
+    # Review-AccessReview fails closed above this instead of mis-reporting.
+    if ($null -eq $config.maxTenantUsers) {
+        $config | Add-Member -NotePropertyName 'maxTenantUsers' -NotePropertyValue 5000
+    }
+    elseif ($config.maxTenantUsers -le 0) {
+        throw ("Config validation failed: 'maxTenantUsers' must be a positive number in {0}." -f $Path)
+    }
     return $config
 }
 
@@ -221,6 +234,9 @@ function Get-RoleMapping {
     .SYNOPSIS
         Returns the group/license mapping for a department. Fails closed on
         unknown departments so nobody gets provisioned with a wrong role.
+        Groups MUST be objects with 'id' (Entra object ID) and 'name'.
+        Display names are never used for resolution: a rename or a duplicate
+        display name must not be able to redirect membership changes.
     #>
     [CmdletBinding()]
     param(
@@ -240,15 +256,25 @@ function Get-RoleMapping {
     foreach ($field in @('groups', 'licenses')) {
         if ($null -eq $mapping[$field]) { $mapping[$field] = @() }
     }
+    foreach ($g in $mapping['groups']) {
+        $isLegacy = $g -is [string]
+        $hasId = -not $isLegacy -and -not [string]::IsNullOrWhiteSpace($g['id'])
+        $hasName = -not $isLegacy -and -not [string]::IsNullOrWhiteSpace($g['name'])
+        if ($isLegacy -or -not $hasId -or -not $hasName) {
+            throw ("Role mapping validation failed: department '{0}': every group must be an object with 'id' and 'name' (Entra object ID, not display name). " -f $Department +
+                "Look up IDs with: Get-MgGroup -Filter ""displayName eq 'sg-name'"" | Select-Object Id, DisplayName")
+        }
+    }
     return $mapping
 }
 
 function Get-ManagedGroupUniverse {
     <#
     .SYNOPSIS
-        Returns every group name referenced by any role mapping. The mover
+        Returns every group ID referenced by any role mapping. The mover
         only removes memberships inside this universe, so manually assigned
-        access outside lifecycle management is never touched.
+        access outside lifecycle management is never touched. IDs, not
+        display names: the universe must be immune to renames.
     #>
     [CmdletBinding()]
     param(
@@ -256,10 +282,48 @@ function Get-ManagedGroupUniverse {
     )
     $mappings = Get-Content -Path $Path -Raw -Encoding utf8 | ConvertFrom-Json -Depth 10 -AsHashtable
     $universe = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($dept in $mappings.Keys) {
-        foreach ($g in $mappings[$dept]['groups']) { [void]$universe.Add($g) }
+    foreach ($dept in $mappings.Keys | Where-Object { -not $_.StartsWith('_') }) {
+        # Reuses Get-RoleMapping so the group shape is validated here too.
+        $mapping = Get-RoleMapping -Path $Path -Department $dept
+        foreach ($g in $mapping['groups']) { [void]$universe.Add($g['id']) }
     }
     return @($universe)
+}
+
+function Assert-LeaverForceAuthorization {
+    <#
+    .SYNOPSIS
+        Fails closed when -Force is used without a change-ticket reference.
+        Unattended mass offboarding without an approved change record is not
+        permitted; the ticket reference is audit-logged by the caller.
+    #>
+    [CmdletBinding()]
+    param(
+        [bool]$Force,
+        [string]$ChangeTicket
+    )
+    if ($Force -and [string]::IsNullOrWhiteSpace($ChangeTicket)) {
+        throw '-Force requires -ChangeTicket with the approved change record reference (e.g. -ChangeTicket "CHG-1234"). Unattended offboarding without a ticket is not permitted.'
+    }
+}
+
+function Assert-TenantSize {
+    <#
+    .SYNOPSIS
+        Fails closed when the tenant exceeds the tool's designed size.
+        Tenant-wide reads are not paged beyond the Graph SDK defaults, so
+        results on large tenants may be incomplete. This tool is sized for
+        small-business tenants; it refuses rather than mis-reports.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$UserCount,
+        [Parameter(Mandatory)][int]$MaxUsers
+    )
+    if ($UserCount -gt $MaxUsers) {
+        throw ("Tenant has {0} users, above the designed limit of {1} (config 'maxTenantUsers'). " -f $UserCount, $MaxUsers +
+            "This tool is sized for small-business tenants and fails closed rather than returning incomplete results.")
+    }
 }
 
 function Compare-MembershipPlan {
@@ -344,6 +408,8 @@ Export-ModuleMember -Function @(
     'Get-LifecycleConfig',
     'Get-RoleMapping',
     'Get-ManagedGroupUniverse',
+    'Assert-LeaverForceAuthorization',
+    'Assert-TenantSize',
     'Compare-MembershipPlan',
     'New-LifecycleUpn',
     'New-TemporaryPassword'

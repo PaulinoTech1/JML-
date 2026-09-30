@@ -1,6 +1,10 @@
 # App Registration: Least-Privilege Permissions
 
-Each script needs only the permissions for its own job. Register one app per script (or one app with the union, if you prefer fewer registrations), and grant **application** permissions for automation or **delegated** permissions for interactive testing.
+Each script needs only the permissions for its own job. **Register one app per script.** Separate registrations bound the blast radius: the read-only review app can never mutate anything, and a compromised joiner credential does not carry the leaver's permissions.
+
+A single app with the union of all permissions is supported but **not recommended**: one credential would then hold full user/group/license control of the tenant, and a compromise anywhere is a compromise everywhere. For a small business, separate registrations are free and take minutes each. There is no good reason to use the union.
+
+Grant **application** permissions for automation or **delegated** permissions for interactive testing. In interactive mode each script requests only its own scopes (see the `$*Scopes` variables in `src/`).
 
 > Verify these against the [Microsoft Graph permissions reference](https://learn.microsoft.com/en-us/graph/permissions-reference) before granting. Permission requirements evolve; this table was written against the v1.0 endpoint in 2026.
 
@@ -29,7 +33,8 @@ Each script needs only the permissions for its own job. Register one app per scr
 | `User.ReadWrite.All` | Revoke sessions, disable account, remove licenses, stamp leave date |
 | `GroupMember.ReadWrite.All` | Remove direct group memberships |
 | `Directory.Read.All` | Enumerate memberships |
-| `DeviceManagementManagedDevices.PrivilegedOperations.All` | **Only if** using `-IncludeDevices` for mobile wipe |
+
+> Device wipes are out of scope for the lifecycle scripts (Intune is a separate permission boundary), so no `DeviceManagement*` permission is needed.
 
 ## Access review (`Review-AccessReview.ps1`, read-only)
 
@@ -42,10 +47,13 @@ Each script needs only the permissions for its own job. Register one app per scr
 
 ## Registration checklist
 
-1. Microsoft Entra admin center > Identity > Applications > App registrations > New registration.
+1. Microsoft Entra admin center > Identity > Applications > App registrations > New registration. **One registration per script** (joiner, mover, leaver, access review).
 2. No redirect URI needed for app-only (client credentials) flow.
-3. API permissions > Add > Microsoft Graph > **Application** permissions > add the rows above.
+3. API permissions > Add > Microsoft Graph > **Application** permissions > add only the rows for that script's table above.
 4. Grant admin consent.
-5. Certificates & secrets: prefer a **certificate** over a client secret. Upload the public cert, keep the private key in the machine store of the automation host.
-6. If you must use a secret: store it in the automation host's secret store and expose it only as `LIFECYCLE_CLIENT_SECRET` at runtime. It must never appear in this repo, in logs, or in chat.
-7. Conditional Access: consider a policy that restricts this app to your automation host's network location.
+5. **Verify your grants.** After consenting, open the app's API permissions blade and confirm the granted list matches the table, nothing more. Re-verify after any permission change. The scripts cannot enforce what the app registration grants; this check is on you.
+6. Certificates & secrets: prefer a **certificate** over a client secret. Upload the public cert, keep the private key in the machine store of the automation host.
+7. If you must use a secret: store it in the automation host's secret store (Task Scheduler credential, Azure Automation variable, etc.) and expose it only as `LIFECYCLE_CLIENT_SECRET` at runtime. **Never** set it with an interactive `export` or `$env:` assignment: it lands in shell history and stays in process memory. It must never appear in this repo, in logs, or in chat. Expect a warning on every run until you switch to a certificate.
+8. Conditional Access: consider a policy that restricts this app to your automation host's network location.
+
+> Residual risk, stated plainly: Microsoft Graph's user permissions are coarse. `User.ReadWrite.All` lets an app create users *and* disable them, so even per-script registrations leave each mutating app high-value. Separate apps bound the blast radius; they do not eliminate it. Protect these credentials like the tenant depends on it, because it does.

@@ -4,12 +4,14 @@ How to run identity lifecycle automation in production. Written for the admin wh
 
 ## One-time setup
 
-1. Complete `docs/APP_REGISTRATION.md`. Prefer certificate auth.
+1. Complete `docs/APP_REGISTRATION.md`. Prefer certificate auth. Register one app per script.
 2. Copy and fill in the configs:
    - `config/lifecycle-config.json` (from `.example`)
    - `config/role-mappings.json` (from `.example`)
 3. Validate SKU part numbers: `Get-MgSubscribedSku | Select-Object SkuPartNumber, SkuId`.
-4. Run every script once with `-Interactive` and **without** `-Apply` against a test user. Read the audit log. Confirm the plan matches your intent.
+4. Look up group object IDs for the role mappings: `Get-MgGroup | Select-Object Id, DisplayName`. Groups are referenced by immutable ID, never display name.
+5. Run every script once with `-Interactive` and **without** `-Apply` against a test user. Read the audit log. Confirm the plan matches your intent.
+6. Note the tenant-size boundary: this tool is sized for tenants up to `maxTenantUsers` (default 5,000). The access review fails closed above it.
 
 ## Joiner (new hire)
 
@@ -38,12 +40,13 @@ How to run identity lifecycle automation in production. Written for the admin wh
 1. Confirm the termination with HR in the ticket. This script is destructive by design.
 2. Dry run first. Verify the group list being removed looks complete.
 3. Live run: `./src/Leaver-OffboardEmployee.ps1 -UserPrincipalName '...' -Apply`, then type the confirmation phrase.
-4. **Mailbox (manual, Exchange Online):** convert to a shared mailbox or set forwarding, then remove the license (the script already removed licenses; re-add briefly if the shared mailbox exceeds 50 GB per Microsoft's rules, then remove again after conversion):
+4. **Scheduled/unattended runs:** `-Force` skips the typed confirmation but **requires** `-ChangeTicket` with the approved change record reference (e.g. `-Force -ChangeTicket 'CHG-1234'`). The ticket is written to the audit log. `-Force` without a ticket fails closed.
+5. **Mailbox (manual, Exchange Online):** convert to a shared mailbox or set forwarding, then remove the license (the script already removed licenses; re-add briefly if the shared mailbox exceeds 50 GB per Microsoft's rules, then remove again after conversion):
    ```powershell
    Set-Mailbox 'user@domain' -Type Shared
    ```
-5. Wipe mobile devices only with explicit approval: `-IncludeDevices`.
-6. File the audit log path in the termination ticket.
+6. **Mobile devices:** device wipe is an Intune action, separate from lifecycle automation. Handle it in Intune with its own approval; these scripts never wipe devices.
+7. File the audit log path in the termination ticket.
 
 ## Quarterly access review
 
@@ -58,5 +61,5 @@ How to run identity lifecycle automation in production. Written for the admin wh
 ## Rollback notes
 
 - **Joiner/mover mistakes** are reversible: re-run the mover with the correct department, or manually re-add groups. Licenses can be reassigned.
-- **Leaver mistakes** are partially reversible: a disabled account can be re-enabled within the retention window, group memberships must be re-added manually (the audit log lists exactly what was removed), licenses must be reassigned. **There is no undo button for device wipes.** That switch exists for a reason and requires explicit opt-in.
+- **Leaver mistakes** are partially reversible: a disabled account can be re-enabled within the retention window, group memberships must be re-added manually (the audit log lists exactly what was removed), licenses must be reassigned.
 - The audit log is the source of truth for what changed. Keep it.

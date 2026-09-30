@@ -1,6 +1,6 @@
 # Identity Lifecycle Automation (Joiner / Mover / Leaver)
 
-PowerShell automation for employee identity lifecycle management in Microsoft Entra ID, built for small IT teams that need enterprise-grade offboarding discipline without enterprise headcount.
+PowerShell automation for employee identity lifecycle management in Microsoft Entra ID, built for small businesses: disciplined joiner/mover/leaver automation for the shop where IT is one person wearing five hats. Sized for tenants up to 5,000 users; it fails closed above that instead of pretending to scale.
 
 ## What this is
 
@@ -10,7 +10,7 @@ Four scripts that cover the full employee lifecycle:
 |---|---|---|
 | `src/Joiner-NewEmployee.ps1` | Provisions account, groups, licenses, manager | Yes (gated) |
 | `src/Mover-UpdateEmployee.ps1` | Reconciles access after department/role change | Yes (gated) |
-| `src/Leaver-OffboardEmployee.ps1` | Revokes sessions, disables account, strips access and licenses | Yes (gated, typed confirmation) |
+| `src/Leaver-OffboardEmployee.ps1` | Revokes sessions, disables account, strips access and licenses | Yes (gated, typed confirmation; `-Force` requires `-ChangeTicket`) |
 | `src/Review-AccessReview.ps1` | Quarterly access review: stale accounts, privileged roles, guests, license waste | **No, read-only** |
 
 Plus a shared module (`src/modules/IdentityLifecycle.Common.psm1`) that enforces the safety model in one place, Pester tests for the pure logic, and runbooks.
@@ -24,10 +24,12 @@ This repo treats identity automation as a loaded tool. Three guardrails are stru
 3. **JSONL audit trail.** Every planned, executed, skipped, and failed action is appended to a timestamped audit log under `logs/`. The log records *that* a password was set, never the password itself.
 
 Additional rules:
-- The **leaver** requires typed confirmation (`DISABLE user@domain`) even with `-Apply`, unless `-Force` is passed for scheduled runs with an approved change record.
+- The **leaver** requires typed confirmation (`DISABLE user@domain`) even with `-Apply`. `-Force` skips the prompt for scheduled runs but **requires** `-ChangeTicket` with the approved change record reference, which is written to the audit log. `-Force` without a ticket fails closed.
 - The **mover** only removes memberships inside the *managed universe* (groups referenced by your role mappings). Manually assigned access outside lifecycle management is never touched.
-- Config validation **fails closed**: unknown departments, missing fields, and missing files throw before anything runs.
-- Secrets come from environment variables or certificates. Never from files in this repo.
+- Groups are referenced by **immutable object ID**, never display name. A rename or duplicate display name cannot redirect membership changes; a config name that drifts from the tenant's display name produces a warning.
+- Config validation **fails closed**: unknown departments, missing fields, legacy display-name group entries, and missing files throw before anything runs.
+- Tenant-size guard: the access review **fails closed** above `maxTenantUsers` (default 5,000) rather than returning incomplete results from unpaged Graph queries.
+- Secrets come from environment variables or certificates. Never from files in this repo. Certificate auth is strongly preferred over client secrets.
 
 ## Quickstart
 
