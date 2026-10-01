@@ -220,7 +220,10 @@ function Get-LifecycleConfig {
     # Tenant-size boundary. This tool is sized for small-business tenants;
     # tenant-wide reads are not paged beyond the Graph SDK defaults, so
     # Review-AccessReview fails closed above this instead of mis-reporting.
-    if ($null -eq $config.maxTenantUsers) {
+    # NOTE: this module runs under Set-StrictMode, so a possibly-missing
+    # property must be probed via PSObject.Properties (a static
+    # $config.maxTenantUsers reference throws PropertyNotFoundException).
+    if ($null -eq $config.PSObject.Properties['maxTenantUsers']) {
         $config | Add-Member -NotePropertyName 'maxTenantUsers' -NotePropertyValue 5000
     }
     elseif ($config.maxTenantUsers -le 0) {
