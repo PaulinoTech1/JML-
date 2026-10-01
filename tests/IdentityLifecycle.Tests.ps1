@@ -203,3 +203,77 @@ Describe 'New-TemporaryPassword' {
         $a | Should -Not -Be $b
     }
 }
+
+Describe 'ConvertTo-GraphFilterLiteral' {
+    It 'doubles single quotes for OData filter embedding' {
+        ConvertTo-GraphFilterLiteral "o'brien@contoso.com" | Should -Be "o''brien@contoso.com"
+    }
+
+    It 'passes through strings without quotes unchanged' {
+        ConvertTo-GraphFilterLiteral 'ada.lovelace@contoso.com' | Should -Be 'ada.lovelace@contoso.com'
+    }
+
+    It 'escapes multiple quotes' {
+        ConvertTo-GraphFilterLiteral "it's a 'test'" | Should -Be "it''s a ''test''"
+    }
+}
+
+Describe 'Assert-ChangeTicket' {
+    It 'throws when the ticket is missing' {
+        { Assert-ChangeTicket -ChangeTicket '' -Context 'Device wipe (-IncludeDevices)' } | Should -Throw '*ChangeTicket*'
+    }
+
+    It 'passes with any non-empty ticket when no pattern is configured' {
+        { Assert-ChangeTicket -ChangeTicket 'literally-anything' } | Should -Not -Throw
+    }
+
+    It 'enforces the configured pattern' {
+        { Assert-ChangeTicket -ChangeTicket 'CHG-1234' -TicketPattern '^CHG-[0-9]+$' } | Should -Not -Throw
+    }
+
+    It 'throws when the ticket does not match the configured pattern' {
+        { Assert-ChangeTicket -ChangeTicket 'oops' -TicketPattern '^CHG-[0-9]+$' } | Should -Throw '*changeTicketPattern*'
+    }
+}
+
+Describe 'Assert-LeaverForceAuthorization ticket pattern' {
+    It 'enforces the pattern when one is supplied' {
+        { Assert-LeaverForceAuthorization -Force $true -ChangeTicket 'nope' -TicketPattern '^CHG-[0-9]+$' } | Should -Throw '*changeTicketPattern*'
+    }
+
+    It 'accepts a matching ticket with a pattern supplied' {
+        { Assert-LeaverForceAuthorization -Force $true -ChangeTicket 'CHG-42' -TicketPattern '^CHG-[0-9]+$' } | Should -Not -Throw
+    }
+}
+
+Describe 'Get-LifecycleConfig changeTicketPattern' {
+    It 'defaults changeTicketPattern to empty when absent' {
+        $path = Join-Path $testRoot 'config-nopattern.json'
+        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
+        $config = Get-LifecycleConfig -Path $path
+        $config.changeTicketPattern | Should -Be ''
+    }
+
+    It 'accepts a valid changeTicketPattern regex' {
+        $path = Join-Path $testRoot 'config-pattern.json'
+        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","changeTicketPattern":"^CHG-[0-9]+$"}' | Set-Content -Path $path -Encoding utf8
+        $config = Get-LifecycleConfig -Path $path
+        $config.changeTicketPattern | Should -Be '^CHG-[0-9]+$'
+    }
+
+    It 'rejects an invalid changeTicketPattern regex at load time' {
+        $path = Join-Path $testRoot 'config-badpattern.json'
+        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","changeTicketPattern":"([unclosed"}' | Set-Content -Path $path -Encoding utf8
+        { Get-LifecycleConfig -Path $path } | Should -Throw '*changeTicketPattern*'
+    }
+}
+
+Describe 'Failed step tracking' {
+    It 'starts at zero for a new run and counts registered failures' {
+        $logDir = Join-Path $testRoot 'logs-failcount'
+        Initialize-LifecycleRun -ScriptName 'Test' -LogDirectory $logDir | Out-Null
+        Get-LifecycleFailedStepCount | Should -Be 0
+        Register-LifecycleStepFailure -Action 'Test.Step' -Target 'test-target' -Detail 'boom' | Out-Null
+        Get-LifecycleFailedStepCount | Should -Be 1
+    }
+}

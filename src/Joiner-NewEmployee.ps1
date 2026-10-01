@@ -64,7 +64,7 @@ try {
     Write-Host "Target UPN: $upn"
 
     # --- Idempotency: never create a duplicate ---
-    $existing = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f $upn) -ConsistencyLevel eventual -CountVariable _count -ErrorAction Stop
+    $existing = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $upn)) -ConsistencyLevel eventual -CountVariable _count -ErrorAction Stop
     if ($existing) {
         Write-LifecycleAudit -Action 'User.Create' -Target $upn -Result 'Skipped' -Detail 'UPN already exists; no duplicate created.' | Out-Null
         Write-Host "User $upn already exists. Nothing to do (idempotent skip)." -ForegroundColor Yellow
@@ -96,8 +96,8 @@ try {
     foreach ($entry in $mapping['groups']) {
         $group = Get-MgGroup -GroupId $entry['id'] -ErrorAction Stop
         if (-not $group) {
-            Write-LifecycleAudit -Action 'GroupMember.Add' -Target "$upn -> $($entry['name'])" -Result 'Failed' `
-                -Detail ("Group ID not found in tenant: {0}" -f $entry['id']) | Out-Null
+            Register-LifecycleStepFailure -Action 'GroupMember.Add' -Target "$upn -> $($entry['name'])" `
+                -Detail ("Group ID not found in tenant: {0}" -f $entry['id'])
             Write-Warning ("Group ID '{0}' (config name '{1}') not found in tenant. Skipped." -f $entry['id'], $entry['name'])
             continue
         }
@@ -110,17 +110,19 @@ try {
     }
 
     # --- 3. Licenses from the role mapping ---
+    $expectedSkuIds = @()
     if ($mapping['licenses'].Count -gt 0) {
         $skus = Get-MgSubscribedSku -ErrorAction Stop
         $addLicenses = foreach ($partNumber in $mapping['licenses']) {
             $sku = $skus | Where-Object { $_.SkuPartNumber -eq $partNumber }
             if (-not $sku) {
                 Write-Warning "License SKU '$partNumber' not found in tenant. Skipped."
-                Write-LifecycleAudit -Action 'License.Assign' -Target "$upn -> $partNumber" -Result 'Failed' -Detail 'SKU not found in tenant.' | Out-Null
+                Register-LifecycleStepFailure -Action 'License.Assign' -Target "$upn -> $partNumber" -Detail 'SKU not found in tenant.'
                 continue
             }
             @{ SkuId = $sku.SkuId }
         }
+        $expectedSkuIds = @($addLicenses | ForEach-Object { $_.SkuId })
         if ($addLicenses.Count -gt 0) {
             Invoke-LifecycleStep -Action 'License.Assign' -Target $upn `
                 -Detail ("skus={0}" -f (($mapping['licenses']) -join ',')) `
@@ -132,7 +134,7 @@ try {
 
     # --- 4. Manager ---
     if (-not [string]::IsNullOrWhiteSpace($ManagerUPN)) {
-        $manager = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f $ManagerUPN) -ErrorAction Stop
+        $manager = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $ManagerUPN)) -ErrorAction Stop
         if ($manager) {
             Invoke-LifecycleStep -Action 'User.SetManager' -Target "$upn -> $ManagerUPN" -ScriptBlock {
                 Set-MgUserManagerByRef -UserId $targetUserId -BodyParameter @{ '@odata.id' = ("https://graph.microsoft.com/v1.0/users/{0}" -f $manager.Id) }
@@ -146,6 +148,41 @@ try {
     if (-not $enableNow) {
         Write-Host ("Account created DISABLED (start date {0:d}). Enable on start date per docs/RUNBOOK.md." -f $StartDate) -ForegroundColor Yellow
         Write-LifecycleAudit -Action 'User.EnableDeferred' -Target $upn -Result 'Planned' -Detail ("enable on {0:yyyy-MM-dd}" -f $StartDate) | Out-Null
+    }
+
+    # --- Post-apply verification: re-query and assert the intended end state.
+    # Warn, don't throw: Graph eventual consistency can lag, and a false
+    # failure here must not mask the audit trail. Mismatch = operator review.
+    if ($Apply.IsPresent -and $targetUserId) {
+        $verifyProblems = @()
+        $actualGroupIds = @(Get-MgUserMemberOf -UserId $targetUserId -All -ErrorAction Stop |
+            Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.group' } |
+            ForEach-Object { $_.Id })
+        $targetGroupIds = @($mapping['groups'] | ForEach-Object { $_['id'] })
+        $missingGroups = @($targetGroupIds | Where-Object { $actualGroupIds -notcontains $_ })
+        if ($missingGroups.Count -gt 0) { $verifyProblems += ("missingGroups={0}" -f ($missingGroups -join ',')) }
+
+        $actualSkuIds = @((Get-MgUserLicenseDetail -UserId $targetUserId -ErrorAction Stop) | ForEach-Object { $_.SkuId })
+        $missingSkus = @($expectedSkuIds | Where-Object { $actualSkuIds -notcontains $_ })
+        if ($missingSkus.Count -gt 0) { $verifyProblems += ("missingLicenses={0}" -f ($missingSkus -join ',')) }
+
+        if ($verifyProblems.Count -gt 0) {
+            $verifyDetail = $verifyProblems -join '; '
+            Write-Warning ("Post-apply verification FAILED: {0}. Review the audit log; the tenant may need reconciliation." -f $verifyDetail)
+            Write-LifecycleAudit -Action 'Verify.ProvisionState' -Target $upn -Result 'Failed' -Detail $verifyDetail | Out-Null
+        }
+        else {
+            Write-LifecycleAudit -Action 'Verify.ProvisionState' -Target $upn -Result 'Executed' -Detail 'groups and licenses match the role mapping' | Out-Null
+        }
+    }
+
+    # --- Partial-failure summary. Steps are sequential with no automatic
+    # rollback; re-running is safe for the idempotent steps, and the audit
+    # log shows exactly which steps need attention. See docs/RUNBOOK.md.
+    $failedSteps = Get-LifecycleFailedStepCount
+    if ($failedSteps -gt 0) {
+        Write-Warning ("{0} step(s) FAILED. The tenant may be partially provisioned. Reconcile from the audit log before re-running: {1}" -f $failedSteps, $run.AuditLogPath)
+        Write-LifecycleAudit -Action 'Run.PartialFailure' -Target 'Joiner-NewEmployee' -Result 'Failed' -Detail ("failedSteps={0}" -f $failedSteps) | Out-Null
     }
 
     Write-Host ("Done. Audit log: {0}" -f $run.AuditLogPath) -ForegroundColor Cyan

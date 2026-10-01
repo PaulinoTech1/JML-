@@ -17,9 +17,13 @@
     Order of operations:
       1. Revoke all refresh sessions/tokens (kills active access first).
       2. Disable the account (blocks new sign-ins).
-      3. Remove all direct group memberships.
+      3. Remove ALL direct group memberships (not just the managed
+         universe: unlike the mover, the leaver assumes no access should
+         survive. Recovery is the JSONL audit log plus manual re-adds;
+         see docs/RUNBOOK.md).
       4. Remove all licenses.
       5. Stamp employeeLeaveDateTime.
+      6. Optionally wipe enrolled devices (-IncludeDevices, separately gated).
 
     Mailbox handling is intentionally OUT OF SCOPE for the Graph-only core:
     converting to a shared mailbox or setting forwarding requires Exchange
@@ -81,8 +85,12 @@ Set-LifecycleMode -Apply $Apply.IsPresent
 $run = Initialize-LifecycleRun -ScriptName 'Leaver-OffboardEmployee' -LogDirectory $LogDirectory
 Write-Host ("Run {0} | dryRun={1} | audit: {2}" -f $run.RunId, $run.DryRun, $run.AuditLogPath) -ForegroundColor Cyan
 
+# Fail-closed config validation first: also provides the optional
+# 'changeTicketPattern' used by the gates below.
+$config = Get-LifecycleConfig -Path $ConfigPath
+
 # Authorization gate: unattended offboarding requires a change record.
-Assert-LeaverForceAuthorization -Force $Force.IsPresent -ChangeTicket $ChangeTicket
+Assert-LeaverForceAuthorization -Force $Force.IsPresent -ChangeTicket $ChangeTicket -TicketPattern $config.changeTicketPattern
 if ($Force.IsPresent) {
     Write-LifecycleAudit -Action 'Leaver.ForceAuthorization' -Target $UserPrincipalName -Result 'Executed' `
         -Detail ("changeTicket={0}" -f $ChangeTicket) | Out-Null
@@ -93,9 +101,7 @@ if ($Force.IsPresent) {
 # -ChangeTicket reference in EVERY mode (interactive included), and the
 # authorization is audit-logged with the ticket.
 if ($IncludeDevices.IsPresent) {
-    if ([string]::IsNullOrWhiteSpace($ChangeTicket)) {
-        throw "Device wipe requested (-IncludeDevices) without -ChangeTicket. Remote wipe requires an approved change record reference; re-run with -ChangeTicket '<ticket>'."
-    }
+    Assert-ChangeTicket -ChangeTicket $ChangeTicket -TicketPattern $config.changeTicketPattern -Context 'Device wipe (-IncludeDevices)'
     Write-LifecycleAudit -Action 'Leaver.DeviceWipeAuthorization' -Target $UserPrincipalName -Result 'Executed' `
         -Detail ("changeTicket={0}" -f $ChangeTicket) | Out-Null
 }
@@ -113,9 +119,8 @@ if ($Apply.IsPresent -and -not $Force.IsPresent) {
 
 try {
     if ($Interactive) { Connect-LifecycleGraph -Interactive -Scopes $leaverScopes } else { Connect-LifecycleGraph -Scopes $leaverScopes }
-    $null = Get-LifecycleConfig -Path $ConfigPath  # validated for fail-closed behavior
 
-    $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f $UserPrincipalName) -ErrorAction Stop
+    $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $UserPrincipalName)) -ErrorAction Stop
     if (-not $user) { throw "User '$UserPrincipalName' not found." }
 
     # --- 1. Revoke sessions FIRST: kill active access before anything else ---
@@ -183,6 +188,34 @@ try {
         if ($devices.Count -eq 0) {
             Write-LifecycleAudit -Action 'Device.Wipe' -Target $UserPrincipalName -Result 'Skipped' -Detail 'No enrolled devices found.' | Out-Null
         }
+    }
+
+    # --- Post-apply verification: re-query and assert the intended end state.
+    # Warn, don't throw: Graph eventual consistency can lag, and a false
+    # failure here must not mask the audit trail. Any mismatch needs
+    # operator review, not an automatic retry.
+    if ($Apply.IsPresent) {
+        $recheck = Get-MgUser -UserId $user.Id -ErrorAction Stop
+        $remainingGroups = @(Get-MgUserMemberOf -UserId $user.Id -All -ErrorAction Stop |
+            Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.group' })
+        $verifyDetail = ("accountEnabled={0} remainingDirectGroups={1}" -f $recheck.AccountEnabled, $remainingGroups.Count)
+        if ($recheck.AccountEnabled -or $remainingGroups.Count -gt 0) {
+            Write-Warning ("Post-apply verification FAILED: {0}. Review the audit log; the tenant may need reconciliation." -f $verifyDetail)
+            Write-LifecycleAudit -Action 'Verify.OffboardState' -Target $UserPrincipalName -Result 'Failed' -Detail $verifyDetail | Out-Null
+        }
+        else {
+            Write-LifecycleAudit -Action 'Verify.OffboardState' -Target $UserPrincipalName -Result 'Executed' -Detail $verifyDetail | Out-Null
+        }
+    }
+
+    # --- Partial-failure summary. Steps are sequential with no automatic
+    # rollback: rolling back a half-finished offboarding could re-enable an
+    # account that must stay disabled. Reconcile from the audit log;
+    # see docs/RUNBOOK.md ("Recovering from a partial failure").
+    $failedSteps = Get-LifecycleFailedStepCount
+    if ($failedSteps -gt 0) {
+        Write-Warning ("{0} step(s) FAILED. The tenant may be partially offboarded. Reconcile from the audit log before re-running: {1}" -f $failedSteps, $run.AuditLogPath)
+        Write-LifecycleAudit -Action 'Run.PartialFailure' -Target 'Leaver-OffboardEmployee' -Result 'Failed' -Detail ("failedSteps={0}" -f $failedSteps) | Out-Null
     }
 
     Write-Host ("Done. Audit log: {0}" -f $run.AuditLogPath) -ForegroundColor Cyan

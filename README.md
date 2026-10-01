@@ -1,6 +1,6 @@
 # Identity Lifecycle Automation (Joiner / Mover / Leaver)
 
-PowerShell automation for employee identity lifecycle management in Microsoft Entra ID, built for small businesses: disciplined joiner/mover/leaver automation for the shop where IT is one person wearing five hats. Sized for tenants up to 5,000 users; it fails closed above that instead of pretending to scale.
+PowerShell automation for employee identity lifecycle management in Microsoft Entra ID, built for small businesses: disciplined joiner/mover/leaver automation for the shop where IT is one person wearing five hats. Sized for tenants up to 1,000 users; it fails closed above that instead of pretending to scale.
 
 ## What this is
 
@@ -28,7 +28,7 @@ Additional rules:
 - The **mover** only removes memberships inside the *managed universe* (groups referenced by your role mappings). Manually assigned access outside lifecycle management is never touched.
 - Groups are referenced by **immutable object ID**, never display name. A rename or duplicate display name cannot redirect membership changes; a config name that drifts from the tenant's display name produces a warning.
 - Config validation **fails closed**: unknown departments, missing fields, legacy display-name group entries, and missing files throw before anything runs.
-- Tenant-size guard: the access review **fails closed** above `maxTenantUsers` (default 5,000) rather than returning incomplete results from unpaged Graph queries.
+- Tenant-size guard: the access review **fails closed** above `maxTenantUsers` (default 1,000) rather than returning incomplete results from unpaged Graph queries.
 - Secrets come from environment variables or certificates. Never from files in this repo. Certificate auth is strongly preferred over client secrets.
 
 ## Quickstart

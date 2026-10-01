@@ -58,7 +58,7 @@ try {
     $mapping = Get-RoleMapping -Path $RoleMapPath -Department $NewDepartment
     $managedUniverse = Get-ManagedGroupUniverse -Path $RoleMapPath
 
-    $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f $UserPrincipalName) -ErrorAction Stop
+    $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $UserPrincipalName)) -ErrorAction Stop
     if (-not $user) { throw "User '$UserPrincipalName' not found." }
 
     # --- Group reconciliation (by immutable object ID, never display name) ---
@@ -77,6 +77,7 @@ try {
     foreach ($groupId in $groupPlan.Add) {
         $group = Get-MgGroup -GroupId $groupId -ErrorAction Stop
         if (-not $group) {
+            Register-LifecycleStepFailure -Action 'GroupMember.Add' -Target "$UserPrincipalName -> $groupId" -Detail 'Group ID not found in tenant.'
             Write-Warning ("Group ID '{0}' not found in tenant. Skipped." -f $groupId)
             continue
         }
@@ -147,7 +148,7 @@ try {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($NewManagerUPN)) {
-        $manager = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f $NewManagerUPN) -ErrorAction Stop
+        $manager = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $NewManagerUPN)) -ErrorAction Stop
         if ($manager) {
             Invoke-LifecycleStep -Action 'User.SetManager' -Target "$UserPrincipalName -> $NewManagerUPN" -ScriptBlock {
                 Set-MgUserManagerByRef -UserId $user.Id -BodyParameter @{ '@odata.id' = ("https://graph.microsoft.com/v1.0/users/{0}" -f $manager.Id) }
@@ -159,6 +160,44 @@ try {
     if ($totalChanges -eq 0) {
         Write-Host 'No changes required. Access already matches the target role mapping.' -ForegroundColor Green
     }
+
+    # --- Post-apply verification: recompute the plans against fresh state and
+    # expect them to be empty. Warn, don't throw: Graph eventual consistency
+    # can lag, and a false failure here must not mask the audit trail.
+    if ($Apply.IsPresent) {
+        $verifyProblems = @()
+        $reMemberOf = Get-MgUserMemberOf -UserId $user.Id -All -ErrorAction Stop
+        $reCurrentGroups = @($reMemberOf | Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.group' } |
+            ForEach-Object { $_.Id } | Where-Object { $_ })
+        $reGroupPlan = Compare-MembershipPlan -Current $reCurrentGroups -Target $targetGroups -ManagedUniverse $managedUniverse
+        if ($reGroupPlan.Add.Count -gt 0 -or $reGroupPlan.Remove.Count -gt 0) {
+            $verifyProblems += ("groups still pending: +{0} -{1}" -f $reGroupPlan.Add.Count, $reGroupPlan.Remove.Count)
+        }
+        $reLicenseDetails = Get-MgUserLicenseDetail -UserId $user.Id -ErrorAction Stop
+        $reCurrentLicenses = @($reLicenseDetails | ForEach-Object { $partNumberOf[$_.SkuId] } | Where-Object { $_ })
+        $reLicensePlan = Compare-MembershipPlan -Current $reCurrentLicenses -Target $mapping['licenses'] -ManagedUniverse $allManagedLicenses
+        if ($reLicensePlan.Add.Count -gt 0 -or $reLicensePlan.Remove.Count -gt 0) {
+            $verifyProblems += ("licenses still pending: +{0} -{1}" -f $reLicensePlan.Add.Count, $reLicensePlan.Remove.Count)
+        }
+        if ($verifyProblems.Count -gt 0) {
+            $verifyDetail = $verifyProblems -join '; '
+            Write-Warning ("Post-apply verification FAILED: {0}. Review the audit log; the tenant may need reconciliation." -f $verifyDetail)
+            Write-LifecycleAudit -Action 'Verify.ReconcileState' -Target $UserPrincipalName -Result 'Failed' -Detail $verifyDetail | Out-Null
+        }
+        else {
+            Write-LifecycleAudit -Action 'Verify.ReconcileState' -Target $UserPrincipalName -Result 'Executed' -Detail 'recomputed plans are empty' | Out-Null
+        }
+    }
+
+    # --- Partial-failure summary. Steps are sequential with no automatic
+    # rollback; the audit log shows exactly which steps need attention.
+    # See docs/RUNBOOK.md ("Recovering from a partial failure").
+    $failedSteps = Get-LifecycleFailedStepCount
+    if ($failedSteps -gt 0) {
+        Write-Warning ("{0} step(s) FAILED. The tenant may be partially reconciled. Reconcile from the audit log before re-running: {1}" -f $failedSteps, $run.AuditLogPath)
+        Write-LifecycleAudit -Action 'Run.PartialFailure' -Target 'Mover-UpdateEmployee' -Result 'Failed' -Detail ("failedSteps={0}" -f $failedSteps) | Out-Null
+    }
+
     Write-Host ("Done. Audit log: {0}" -f $run.AuditLogPath) -ForegroundColor Cyan
     if ($run.DryRun) {
         Write-Host 'This was a DRY RUN. Re-run with -Apply to perform these actions.' -ForegroundColor Yellow

@@ -22,9 +22,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Module-scoped run state. Scripts set this via Set-LifecycleMode.
-$script:DryRun       = $true
-$script:AuditLogPath = $null
-$script:RunId        = $null
+$script:DryRun          = $true
+$script:AuditLogPath    = $null
+$script:RunId           = $null
+$script:FailedStepCount = 0
 
 function Set-LifecycleMode {
     <#
@@ -50,6 +51,7 @@ function Initialize-LifecycleRun {
         [Parameter(Mandatory)][string]$LogDirectory
     )
     $script:RunId = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $script:FailedStepCount = 0
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     if (-not (Test-Path -Path $LogDirectory)) {
         New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
@@ -129,9 +131,59 @@ function Invoke-LifecycleStep {
         return $output
     }
     catch {
-        Write-LifecycleAudit -Action $Action -Target $Target -Result 'Failed' -Detail $_.Exception.Message | Out-Null
+        Register-LifecycleStepFailure -Action $Action -Target $Target -Detail $_.Exception.Message
         Write-Error ("FAILED {0} -> {1}: {2}" -f $Action, $Target, $_.Exception.Message)
     }
+}
+
+function Get-LifecycleFailedStepCount {
+    <#
+    .SYNOPSIS
+        Returns the number of lifecycle steps that failed in the current run.
+        Steps are sequential and independent: a failed group add does not
+        roll back earlier steps. Callers print an end-of-run summary and the
+        operator reconciles from the JSONL audit log. Automatic rollback is
+        deliberately not attempted (rolling back a half-finished offboarding
+        could re-enable an account that must stay disabled).
+    #>
+    [CmdletBinding()]
+    param()
+    return $script:FailedStepCount
+}
+
+function Register-LifecycleStepFailure {
+    <#
+    .SYNOPSIS
+        Records a failed step that bypasses Invoke-LifecycleStep (e.g. a
+        lookup that fails before the mutation choke point is reached).
+        Audits the failure and increments the run's failed-step counter so
+        the end-of-run summary stays accurate.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][string]$Target,
+        [string]$Detail = ''
+    )
+    $script:FailedStepCount++
+    Write-LifecycleAudit -Action $Action -Target $Target -Result 'Failed' -Detail $Detail | Out-Null
+}
+
+function ConvertTo-GraphFilterLiteral {
+    <#
+    .SYNOPSIS
+        Escapes a string for embedding in a Microsoft Graph $filter expression.
+        OData string literals escape a single quote by doubling it ('').
+        Without this, a UPN containing ' breaks the filter or alters the
+        query. Graph is not SQL, but the failure mode is real.
+    .EXAMPLE
+        ConvertTo-GraphFilterLiteral "o'brien@contoso.com"  # o''brien@contoso.com
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Value
+    )
+    return $Value.Replace("'", "''")
 }
 
 function Connect-LifecycleGraph {
@@ -231,6 +283,21 @@ function Get-LifecycleConfig {
     elseif ($config.maxTenantUsers -le 0) {
         throw ("Config validation failed: 'maxTenantUsers' must be a positive number in {0}." -f $Path)
     }
+    # Optional change-ticket format enforcement. Absent = any non-empty
+    # ticket reference satisfies the gate (presence check only; approval is
+    # process control, not code control). Present = the ticket must match.
+    # An invalid regex fails closed here, at config load, not at 2 AM.
+    if ($null -eq $config.PSObject.Properties['changeTicketPattern']) {
+        $config | Add-Member -NotePropertyName 'changeTicketPattern' -NotePropertyValue ''
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($config.changeTicketPattern)) {
+        try {
+            [void][regex]::new($config.changeTicketPattern)
+        }
+        catch {
+            throw ("Config validation failed: 'changeTicketPattern' is not a valid regex in {0}: {1}" -f $Path, $_.Exception.Message)
+        }
+    }
     return $config
 }
 
@@ -298,6 +365,31 @@ function Get-ManagedGroupUniverse {
     return ,@($universe)
 }
 
+function Assert-ChangeTicket {
+    <#
+    .SYNOPSIS
+        Validates a change-ticket reference for a gated operation.
+        Always requires a non-empty value. When the config supplies
+        'changeTicketPattern', the ticket must also match that regex.
+        Honest scope: this checks the reference is present and well-formed.
+        It does NOT verify approval in an ITSM, check a signature, or stop
+        an operator from inventing a ticket ID. That is process control,
+        enforced by your change process and the audit log, not by this code.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$ChangeTicket,
+        [string]$TicketPattern = '',
+        [string]$Context = 'This operation'
+    )
+    if ([string]::IsNullOrWhiteSpace($ChangeTicket)) {
+        throw ("{0} requires -ChangeTicket with the approved change record reference (e.g. -ChangeTicket `"CHG-1234`")." -f $Context)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TicketPattern) -and $ChangeTicket -notmatch $TicketPattern) {
+        throw ("Change ticket '{0}' does not match the required format '{1}' (config 'changeTicketPattern')." -f $ChangeTicket, $TicketPattern)
+    }
+}
+
 function Assert-LeaverForceAuthorization {
     <#
     .SYNOPSIS
@@ -308,10 +400,11 @@ function Assert-LeaverForceAuthorization {
     [CmdletBinding()]
     param(
         [bool]$Force,
-        [string]$ChangeTicket
+        [string]$ChangeTicket,
+        [string]$TicketPattern = ''
     )
-    if ($Force -and [string]::IsNullOrWhiteSpace($ChangeTicket)) {
-        throw '-Force requires -ChangeTicket with the approved change record reference (e.g. -ChangeTicket "CHG-1234"). Unattended offboarding without a ticket is not permitted.'
+    if ($Force) {
+        Assert-ChangeTicket -ChangeTicket $ChangeTicket -TicketPattern $TicketPattern -Context '-Force'
     }
 }
 
@@ -411,6 +504,10 @@ Export-ModuleMember -Function @(
     'Initialize-LifecycleRun',
     'Write-LifecycleAudit',
     'Invoke-LifecycleStep',
+    'Get-LifecycleFailedStepCount',
+    'Register-LifecycleStepFailure',
+    'ConvertTo-GraphFilterLiteral',
+    'Assert-ChangeTicket',
     'Connect-LifecycleGraph',
     'Disconnect-LifecycleGraph',
     'Get-LifecycleConfig',

@@ -11,7 +11,7 @@ How to run identity lifecycle automation in production. Written for the admin wh
 3. Validate SKU part numbers: `Get-MgSubscribedSku | Select-Object SkuPartNumber, SkuId`.
 4. Look up group object IDs for the role mappings: `Get-MgGroup | Select-Object Id, DisplayName`. Groups are referenced by immutable ID, never display name.
 5. Run every script once with `-Interactive` and **without** `-Apply` against a test user. Read the audit log. Confirm the plan matches your intent.
-6. Note the tenant-size boundary: this tool is sized for tenants up to `maxTenantUsers` (default 5,000). The access review fails closed above it.
+6. Note the tenant-size boundary: this tool is sized for tenants up to `maxTenantUsers` (default 1,000). The access review fails closed above it.
 
 ## Joiner (new hire)
 
@@ -38,9 +38,9 @@ How to run identity lifecycle automation in production. Written for the admin wh
 ## Leaver (termination)
 
 1. Confirm the termination with HR in the ticket. This script is destructive by design.
-2. Dry run first. Verify the group list being removed looks complete.
+2. Dry run first. Verify the group list being removed looks complete. Note: unlike the mover, the leaver removes **all** direct group memberships, not just the ones in the managed universe. Anything the person needs afterwards must be re-added manually from the audit log.
 3. Live run: `./src/Leaver-OffboardEmployee.ps1 -UserPrincipalName '...' -Apply`, then type the confirmation phrase.
-4. **Scheduled/unattended runs:** `-Force` skips the typed confirmation but **requires** `-ChangeTicket` with the approved change record reference (e.g. `-Force -ChangeTicket 'CHG-1234'`). The ticket is written to the audit log. `-Force` without a ticket fails closed.
+4. **Scheduled/unattended runs:** `-Force` skips the typed confirmation but **requires** `-ChangeTicket` with the approved change record reference (e.g. `-Force -ChangeTicket 'CHG-1234'`). The ticket is written to the audit log. `-Force` without a ticket fails closed. Honest scope: the gate checks the ticket is present (and matches `changeTicketPattern` if you configured one); it does not call your ITSM, check a signature, or stop an invented ticket ID. Ticket approval is your change process's job; the code's job is making the reference undeniable in the audit trail.
 5. **Mailbox (manual, Exchange Online):** convert to a shared mailbox or set forwarding, then remove the license (the script already removed licenses; re-add briefly if the shared mailbox exceeds 50 GB per Microsoft's rules, then remove again after conversion):
    ```powershell
    Set-Mailbox 'user@domain' -Type Shared
@@ -58,8 +58,18 @@ How to run identity lifecycle automation in production. Written for the admin wh
    - `license-waste-*.csv`: reclaim licenses from disabled accounts.
 3. Keep the reports with your compliance evidence.
 
+## Recovering from a partial failure
+
+Steps run sequentially, and there is no automatic rollback: a failed group add does not undo the account creation that preceded it, and rolling back a half-finished offboarding could re-enable an account that must stay disabled. The run prints a failed-step count at the end and writes a `Run.PartialFailure` audit record. Reconcile like this:
+
+1. Open the run's JSONL audit log (the path is printed at the end of the run).
+2. Find every entry with `"result":"Failed"`; each carries the Graph error message in `detail`.
+3. Fix the underlying cause (missing group ID in config, exhausted license SKU, throttled Graph call, typo in the ticket).
+4. Re-run the script. The joiner and mover are idempotent for completed steps (existing UPNs are skipped, converged access produces an empty plan), so re-running only completes what is left. For the leaver, confirm in a dry run that the remaining steps are the ones you expect before applying.
+5. In `-Apply` mode each script also performs a post-apply state check (re-queries the tenant and audits a `Verify.*` record). A `Verify.*` failure is a warning, not a throw: Graph eventual consistency can lag, so treat it as "look at this" rather than "broken". If the state still disagrees after a few minutes, go back to step 2.
+
 ## Rollback notes
 
 - **Joiner/mover mistakes** are reversible: re-run the mover with the correct department, or manually re-add groups. Licenses can be reassigned.
-- **Leaver mistakes** are partially reversible: a disabled account can be re-enabled within the retention window, group memberships must be re-added manually (the audit log lists exactly what was removed), licenses must be reassigned.
+- **Leaver mistakes** are partially reversible: a disabled account can be re-enabled within the retention window, group memberships must be re-added manually (the audit log lists exactly what was removed; remember the leaver removes **all** direct memberships, not just managed-universe ones), licenses must be reassigned.
 - The audit log is the source of truth for what changed. Keep it.
