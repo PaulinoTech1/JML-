@@ -88,11 +88,11 @@ Describe 'Get-LifecycleConfig' {
         { Get-LifecycleConfig -Path (Join-Path $testRoot 'nope.json') } | Should -Throw '*not found*'
     }
 
-    It 'defaults maxTenantUsers to 5000 when absent' {
+    It 'defaults maxTenantUsers to 1000 when absent' {
         $path = Join-Path $testRoot 'config-notenant.json'
         '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
         $config = Get-LifecycleConfig -Path $path
-        $config.maxTenantUsers | Should -Be 5000
+        $config.maxTenantUsers | Should -Be 1000
     }
 
     It 'rejects a non-positive maxTenantUsers' {
@@ -166,15 +166,15 @@ Describe 'Assert-LeaverForceAuthorization' {
 
 Describe 'Assert-TenantSize' {
     It 'throws when the tenant exceeds the designed limit' {
-        { Assert-TenantSize -UserCount 5001 -MaxUsers 5000 } | Should -Throw '*designed limit*'
+        { Assert-TenantSize -UserCount 1001 -MaxUsers 1000 } | Should -Throw '*designed limit*'
     }
 
     It 'passes at exactly the limit' {
-        { Assert-TenantSize -UserCount 5000 -MaxUsers 5000 } | Should -Not -Throw
+        { Assert-TenantSize -UserCount 1000 -MaxUsers 1000 } | Should -Not -Throw
     }
 
     It 'passes below the limit' {
-        { Assert-TenantSize -UserCount 42 -MaxUsers 5000 } | Should -Not -Throw
+        { Assert-TenantSize -UserCount 42 -MaxUsers 1000 } | Should -Not -Throw
     }
 }
 

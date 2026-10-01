@@ -25,8 +25,15 @@
     converting to a shared mailbox or setting forwarding requires Exchange
     Online. See docs/RUNBOOK.md for the manual step.
 
-    Device wipes are intentionally OUT OF SCOPE: wiping enrolled devices is
-    an Intune action with its own permission boundary, not a lifecycle step.
+    Device wipe is OPTIONAL and separately gated: -IncludeDevices wipes the
+    user's Intune-enrolled devices, but it REQUIRES -ChangeTicket with the
+    approved change record reference (in every mode, including interactive),
+    and the authorization is written to the audit log. Remote wipe is a
+    destructive, separately-permissioned Intune action: a wipe issued
+    against the wrong account is unrecoverable, so it is never part of the
+    default offboarding flow. Only enable it when your process calls for
+    it (e.g. lost or stolen devices), and only the DeviceManagement
+    scopes documented in docs/APP_REGISTRATION.md are needed for it.
 .EXAMPLE
     # Dry run: show the full offboarding plan
     ./Leaver-OffboardEmployee.ps1 -UserPrincipalName 'ada.lovelace@contoso.com' -Interactive
@@ -36,6 +43,9 @@
 .EXAMPLE
     # Scheduled run: -Force requires the approved change record reference
     ./Leaver-OffboardEmployee.ps1 -UserPrincipalName 'ada.lovelace@contoso.com' -Apply -Force -ChangeTicket 'CHG-1234'
+.EXAMPLE
+    # Scheduled run with device wipe: ticket is mandatory for the wipe
+    ./Leaver-OffboardEmployee.ps1 -UserPrincipalName 'ada.lovelace@contoso.com' -Apply -Force -ChangeTicket 'CHG-1234' -IncludeDevices
 #>
 
 [CmdletBinding()]
@@ -47,7 +57,8 @@ param(
     [switch]$Interactive,
     [switch]$Apply,
     [switch]$Force,
-    [string]$ChangeTicket = ''
+    [string]$ChangeTicket = '',
+    [switch]$IncludeDevices
 )
 
 Set-StrictMode -Version Latest
@@ -60,6 +71,11 @@ Import-Module Microsoft.Graph.Groups -ErrorAction Stop
 # Least-privilege scopes for the leaver's job only (interactive/delegated mode).
 # App-only permissions come from the app registration; see docs/APP_REGISTRATION.md.
 $leaverScopes = @('User.ReadWrite.All', 'GroupMember.ReadWrite.All', 'Directory.Read.All')
+if ($IncludeDevices.IsPresent) {
+    # Device wipe is a separately-permissioned Intune action: request the
+    # wipe scope only when the wipe is actually requested.
+    $leaverScopes += 'DeviceManagementManagedDevices.PrivilegedOperations.All'
+}
 
 Set-LifecycleMode -Apply $Apply.IsPresent
 $run = Initialize-LifecycleRun -ScriptName 'Leaver-OffboardEmployee' -LogDirectory $LogDirectory
@@ -69,6 +85,18 @@ Write-Host ("Run {0} | dryRun={1} | audit: {2}" -f $run.RunId, $run.DryRun, $run
 Assert-LeaverForceAuthorization -Force $Force.IsPresent -ChangeTicket $ChangeTicket
 if ($Force.IsPresent) {
     Write-LifecycleAudit -Action 'Leaver.ForceAuthorization' -Target $UserPrincipalName -Result 'Executed' `
+        -Detail ("changeTicket={0}" -f $ChangeTicket) | Out-Null
+}
+
+# Device-wipe gate: wiping enrolled devices is destructive and separately
+# permissioned, so it is never implicit. It requires an explicit
+# -ChangeTicket reference in EVERY mode (interactive included), and the
+# authorization is audit-logged with the ticket.
+if ($IncludeDevices.IsPresent) {
+    if ([string]::IsNullOrWhiteSpace($ChangeTicket)) {
+        throw "Device wipe requested (-IncludeDevices) without -ChangeTicket. Remote wipe requires an approved change record reference; re-run with -ChangeTicket '<ticket>'."
+    }
+    Write-LifecycleAudit -Action 'Leaver.DeviceWipeAuthorization' -Target $UserPrincipalName -Result 'Executed' `
         -Detail ("changeTicket={0}" -f $ChangeTicket) | Out-Null
 }
 
@@ -136,6 +164,26 @@ try {
         -Detail ("employeeLeaveDateTime={0:yyyy-MM-dd}" -f $LastDay) -ScriptBlock {
             Update-MgUser -UserId $user.Id -EmployeeLeaveDateTime $LastDay.ToUniversalTime().ToString('o')
         } | Out-Null
+
+    # --- 6. Optional, gated: wipe enrolled mobile devices ---
+    # Reached only when -IncludeDevices was passed AND a -ChangeTicket was
+    # provided (enforced above). Dry-run mode plans but never executes.
+    if ($IncludeDevices.IsPresent) {
+        Import-Module Microsoft.Graph.DeviceManagement -ErrorAction Stop
+        $devices = @(Get-MgUserManagedDevice -UserId $user.Id -All -ErrorAction Stop)
+        Write-Host ("Wiping {0} enrolled devices." -f $devices.Count) -ForegroundColor Red
+        foreach ($device in $devices) {
+            $deviceId = $device.Id
+            $deviceName = $device.DeviceName
+            Invoke-LifecycleStep -Action 'Device.Wipe' -Target ("{0} ({1})" -f $deviceName, $deviceId) `
+                -Detail ("changeTicket={0}" -f $ChangeTicket) -ScriptBlock {
+                    Invoke-MgWipeUserManagedDevice -UserId $user.Id -ManagedDeviceId $deviceId
+                } | Out-Null
+        }
+        if ($devices.Count -eq 0) {
+            Write-LifecycleAudit -Action 'Device.Wipe' -Target $UserPrincipalName -Result 'Skipped' -Detail 'No enrolled devices found.' | Out-Null
+        }
+    }
 
     Write-Host ("Done. Audit log: {0}" -f $run.AuditLogPath) -ForegroundColor Cyan
     Write-Host 'Follow docs/RUNBOOK.md for the mailbox step (shared mailbox conversion / forwarding via Exchange Online).' -ForegroundColor Yellow

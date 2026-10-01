@@ -34,7 +34,7 @@ Grant **application** permissions for automation or **delegated** permissions fo
 | `GroupMember.ReadWrite.All` | Remove direct group memberships |
 | `Directory.Read.All` | Enumerate memberships |
 
-> Device wipes are out of scope for the lifecycle scripts (Intune is a separate permission boundary), so no `DeviceManagement*` permission is needed.
+> **Device wipe (optional):** `-IncludeDevices` on the leaver wipes the user's Intune-enrolled devices. It additionally requires `DeviceManagementManagedDevices.PrivilegedOperations.All` (delegated; app-only equivalent from your Intune permission set) and **always requires `-ChangeTicket`**, in every mode. Only grant this permission on the app registration used for offboarding if your process calls for scripted wipes (e.g. lost/stolen devices); otherwise leave it off and the wipe code path can never execute.
 
 ## Access review (`Review-AccessReview.ps1`, read-only)
 

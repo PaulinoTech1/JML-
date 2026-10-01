@@ -217,14 +217,16 @@ function Get-LifecycleConfig {
             throw ("Config validation failed: required field '{0}' is missing or empty in {1}." -f $field, $Path)
         }
     }
-    # Tenant-size boundary. This tool is sized for small-business tenants;
-    # tenant-wide reads are not paged beyond the Graph SDK defaults, so
-    # Review-AccessReview fails closed above this instead of mis-reporting.
+    # Tenant-size boundary. This tool is sized for small and mid-size
+    # businesses (default ceiling: 1000 users); tenant-wide reads are not
+    # paged beyond the Graph SDK defaults, so Review-AccessReview fails
+    # closed above this instead of mis-reporting. Override maxTenantUsers
+    # in lifecycle-config.json if your tenant is legitimately larger.
     # NOTE: this module runs under Set-StrictMode, so a possibly-missing
     # property must be probed via PSObject.Properties (a static
     # $config.maxTenantUsers reference throws PropertyNotFoundException).
     if ($null -eq $config.PSObject.Properties['maxTenantUsers']) {
-        $config | Add-Member -NotePropertyName 'maxTenantUsers' -NotePropertyValue 5000
+        $config | Add-Member -NotePropertyName 'maxTenantUsers' -NotePropertyValue 1000
     }
     elseif ($config.maxTenantUsers -le 0) {
         throw ("Config validation failed: 'maxTenantUsers' must be a positive number in {0}." -f $Path)

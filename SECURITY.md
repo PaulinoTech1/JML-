@@ -22,7 +22,7 @@ These scripts hold credentials that can create, modify, and destroy identity obj
 - Store credentials, tokens, or passwords anywhere in the repo.
 - Send data anywhere except Microsoft Graph and the local audit log.
 - Handle mailboxes (Exchange Online is a separate permission boundary; the runbook covers the manual step).
-- Wipe devices (Intune is a separate permission boundary; device wipe is an Intune action, not a lifecycle step).
+- Wipe devices by default. Remote wipe is available only as an explicit, separately gated opt-in (`-IncludeDevices` on the leaver, which always requires `-ChangeTicket` and its own Intune permission); it is never part of the default offboarding flow.
 - Auto-approve anything. The human confirms the plan.
 
 ## Reporting a vulnerability

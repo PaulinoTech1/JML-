@@ -45,7 +45,7 @@ How to run identity lifecycle automation in production. Written for the admin wh
    ```powershell
    Set-Mailbox 'user@domain' -Type Shared
    ```
-6. **Mobile devices:** device wipe is an Intune action, separate from lifecycle automation. Handle it in Intune with its own approval; these scripts never wipe devices.
+6. **Mobile devices (optional, gated):** by default the scripts never wipe devices. If your process calls for it (e.g. lost or stolen devices), add `-IncludeDevices` to the leaver run: it wipes the user's Intune-enrolled devices, but it **requires `-ChangeTicket`** with the approved change record reference in every mode, including interactive runs, and the authorization is written to the audit log. A wipe issued against the wrong account is unrecoverable, so never add the flag by habit; confirm the UPN and the ticket first. The app registration also needs the `DeviceManagementManagedDevices.PrivilegedOperations.All` permission (see `docs/APP_REGISTRATION.md`) or the wipe step fails closed.
 7. File the audit log path in the termination ticket.
 
 ## Quarterly access review
