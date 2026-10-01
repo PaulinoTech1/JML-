@@ -15,6 +15,12 @@ Four scripts that cover the full employee lifecycle:
 
 Plus a shared module (`src/modules/IdentityLifecycle.Common.psm1`) that enforces the safety model in one place, Pester tests for the pure logic, and runbooks.
 
+## Architecture
+
+An administrator runs one of four lifecycle workflows. Joiner, mover, and leaver validate their settings against `config/` and gate every mutation through the safeguards; the safeguards append each planned, executed, skipped, and failed action to the hash-chained JSONL audit trail and apply only approved mutations to Microsoft Entra ID. The read-only access review writes its CSV reports under `reports/`.
+
+![JML architecture: administrator, four lifecycle workflows, configuration, safety and audit safeguards, and tenant outputs](docs/architecture.png)
+
 ## Safety model
 
 This repo treats identity automation as a loaded tool. Three guardrails are structural, not advisory:
