@@ -59,7 +59,8 @@ try {
     $users = Get-MgUser -All -Property 'id,userPrincipalName,displayName,accountEnabled,createdDateTime,signInActivity,userType' -ErrorAction Stop
     # Tenant-wide reads are not paged beyond the Graph SDK defaults.
     # Fail closed on tenants larger than designed rather than mis-reporting.
-    Assert-TenantSize -UserCount $users.Count -MaxUsers $config.maxTenantUsers
+    # @() wrapper: a one-user tenant returns a scalar, not an array.
+    Assert-TenantSize -UserCount @($users).Count -MaxUsers $config.maxTenantUsers
     $stale = @($users | Where-Object {
         $_.UserType -eq 'Member' -and $_.AccountEnabled -and
         ($null -eq $_.SignInActivity.LastSignInDateTime -or $_.SignInActivity.LastSignInDateTime -lt $cutoff)

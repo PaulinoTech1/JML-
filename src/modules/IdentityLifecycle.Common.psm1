@@ -287,7 +287,10 @@ function Get-ManagedGroupUniverse {
         $mapping = Get-RoleMapping -Path $Path -Department $dept
         foreach ($g in $mapping['groups']) { [void]$universe.Add($g['id']) }
     }
-    return @($universe)
+    # Unary comma: without it PowerShell unrolls a one-element array on output
+    # and callers receive a bare string (whose .Count is not 1) instead of an
+    # array. The contract is "array of IDs", including the empty case.
+    return ,@($universe)
 }
 
 function Assert-LeaverForceAuthorization {
