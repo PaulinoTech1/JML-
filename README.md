@@ -13,11 +13,11 @@ Four scripts that cover the full employee lifecycle:
 | `src/Leaver-OffboardEmployee.ps1` | Revokes sessions, disables account, strips access and licenses | Yes (gated, typed confirmation; `-Force` requires `-ChangeTicket`) |
 | `src/Review-AccessReview.ps1` | Quarterly access review: stale accounts, privileged roles, guests, license waste | **No, read-only** |
 
-Plus a shared module (`src/modules/IdentityLifecycle.Common.psm1`) that enforces the safety model in one place, Pester tests for the pure logic, and runbooks.
+Plus a shared module (`src/modules/IdentityLifecycle.Common.psm1`) that enforces the safety model in one place, offline Pester tests for pure logic and stubbed workflows, and runbooks.
 
 ## Architecture
 
-An administrator runs one of four lifecycle workflows. Joiner, mover, and leaver validate their settings against `config/` and gate every mutation through the safeguards; the safeguards append each planned, executed, skipped, and failed action to the hash-chained JSONL audit trail and apply only approved mutations to Microsoft Entra ID. The read-only access review writes its CSV reports under `reports/`.
+An administrator runs one of four lifecycle workflows. Joiner, mover, and leaver validate their settings against `config/` and gate every mutation through the safeguards; the safeguards append each planned, executed, skipped, and failed action to the JSONL audit trail and execute mutations only with explicit `-Apply`. Ticket presence/format checks do not independently establish approval. The read-only access review writes its CSV reports under `reports/`.
 
 ![JML architecture: administrator, four lifecycle workflows, configuration, safety and audit safeguards, and tenant outputs](docs/architecture.png)
 
@@ -36,6 +36,11 @@ Additional rules:
 - Config validation **fails closed**: unknown departments, missing fields, legacy display-name group entries, and missing files throw before anything runs.
 - Tenant-size guard: the access review **fails closed** above `maxTenantUsers` (default 1,000) rather than returning incomplete results from unpaged Graph queries.
 - Secrets come from environment variables or certificates. Never from files in this repo. Certificate auth is strongly preferred over client secrets.
+- The configured tenant GUID is passed to authentication and checked against the environment and authenticated context. Missing or conflicting tenant identity fails closed.
+- Role mappings require explicit group/license arrays; omitted or null policy is never interpreted as intentional empty access.
+- Live mover/leaver runs for the same tenant/user exclude one another on the same host. This does not coordinate separate hosts or external Graph clients.
+
+See [Security corrections and rationale](docs/SECURITY_FIXES.md) for the review findings, migration steps, regression coverage, and exact limits.
 
 ## Quickstart
 

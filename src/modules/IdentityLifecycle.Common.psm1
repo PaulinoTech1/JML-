@@ -199,7 +199,8 @@ function Connect-LifecycleGraph {
           1. App-only with certificate (thumbprint in LIFECYCLE_CERT_THUMBPRINT)
           2. App-only with client secret (secret in LIFECYCLE_CLIENT_SECRET env var)
           3. Interactive delegated sign-in (-Interactive), for testing only.
-        Tenant ID comes from -TenantId or LIFECYCLE_TENANT_ID.
+        Entry points pass the validated config tenant ID. If the tenant
+        environment variable is set, it must agree with that ID.
         Client (app) ID comes from -ClientId or LIFECYCLE_CLIENT_ID.
         Certificate auth is strongly preferred: a client secret lives in
         process memory and can leak into shell history if exported
@@ -221,18 +222,29 @@ function Connect-LifecycleGraph {
     if ([string]::IsNullOrWhiteSpace($TenantId)) {
         throw 'TenantId is required. Set LIFECYCLE_TENANT_ID or pass -TenantId.'
     }
+    $expectedTenant = [guid]::Empty
+    if (-not [guid]::TryParseExact($TenantId, 'D', [ref]$expectedTenant) -or $expectedTenant -eq [guid]::Empty) {
+        throw 'TenantId must be a nonzero tenant GUID.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:LIFECYCLE_TENANT_ID)) {
+        $environmentTenant = [guid]::Empty
+        if (-not [guid]::TryParseExact($env:LIFECYCLE_TENANT_ID, 'D', [ref]$environmentTenant) -or $environmentTenant -ne $expectedTenant) {
+            throw 'LIFECYCLE_TENANT_ID does not match the configured tenantId. Correct the environment or config before running.'
+        }
+    }
+    $TenantId = $expectedTenant.ToString('D')
 
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
     switch ($PSCmdlet.ParameterSetName) {
         'Interactive' {
             Write-Host 'Interactive sign-in requested (testing mode).' -ForegroundColor Cyan
-            Connect-MgGraph -TenantId $TenantId -Scopes $Scopes -NoWelcome
+            Connect-MgGraph -TenantId $TenantId -Scopes $Scopes -ContextScope Process -NoWelcome
         }
         'AppCert' {
             if ([string]::IsNullOrWhiteSpace($CertificateThumbprint)) { throw 'Certificate thumbprint missing. Set LIFECYCLE_CERT_THUMBPRINT.' }
             if ([string]::IsNullOrWhiteSpace($ClientId)) { throw 'ClientId is required for app-only auth. Set LIFECYCLE_CLIENT_ID.' }
-            Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint -NoWelcome
+            Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint -ContextScope Process -NoWelcome
         }
         default {
             if ([string]::IsNullOrWhiteSpace($ClientId)) { throw 'ClientId is required for app-only auth. Set LIFECYCLE_CLIENT_ID.' }
@@ -241,11 +253,17 @@ function Connect-LifecycleGraph {
             }
             Write-Warning 'Client-secret auth in use. Prefer certificate auth (LIFECYCLE_CERT_THUMBPRINT); see docs/APP_REGISTRATION.md.'
             $credential = [pscredential]::new($ClientId, $ClientSecret)
-            Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential -NoWelcome
+            Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential -ContextScope Process -NoWelcome
         }
     }
 
     $context = Get-MgContext
+    $actualTenant = [guid]::Empty
+    if ($null -eq $context -or $null -eq $context.PSObject.Properties['TenantId'] -or
+        -not [guid]::TryParseExact([string]$context.TenantId, 'D', [ref]$actualTenant) -or $actualTenant -ne $expectedTenant) {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+        throw 'Authenticated Graph tenant does not match the configured tenantId. No lifecycle mutations are permitted.'
+    }
     Write-LifecycleAudit -Action 'Graph.Connect' -Target $TenantId -Result 'Executed' `
         -Detail ("authType={0} scopes={1}" -f $context.AuthType, ($context.Scopes -join ',')) | Out-Null
 }
@@ -264,11 +282,17 @@ function Get-LifecycleConfig {
     }
     $config = Get-Content -Path $Path -Raw -Encoding utf8 | ConvertFrom-Json -Depth 10
 
-    foreach ($field in @('domain', 'upnPattern', 'usageLocation')) {
-        if ([string]::IsNullOrWhiteSpace($config.$field)) {
+    foreach ($field in @('tenantId', 'domain', 'upnPattern', 'usageLocation')) {
+        if ($null -eq $config -or $null -eq $config.PSObject.Properties[$field] -or
+            $config.$field -isnot [string] -or [string]::IsNullOrWhiteSpace($config.$field)) {
             throw ("Config validation failed: required field '{0}' is missing or empty in {1}." -f $field, $Path)
         }
     }
+    $tenantGuid = [guid]::Empty
+    if (-not [guid]::TryParseExact($config.tenantId, 'D', [ref]$tenantGuid) -or $tenantGuid -eq [guid]::Empty) {
+        throw 'Config validation failed: tenantId must be a nonzero tenant GUID.'
+    }
+    $config.tenantId = $tenantGuid.ToString('D')
     # Tenant-size boundary. This tool is sized for small and mid-size
     # businesses (default ceiling: 1000 users); tenant-wide reads are not
     # paged beyond the Graph SDK defaults, so Review-AccessReview fails
@@ -313,28 +337,46 @@ function Get-RoleMapping {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Department
+        [Parameter(Mandatory)][string]$Department,
+        [object]$Mappings
     )
-    if (-not (Test-Path -Path $Path)) {
-        throw ("Role mapping file not found: {0}. Copy config/role-mappings.json.example and fill it in." -f $Path)
+    if (-not $PSBoundParameters.ContainsKey('Mappings')) {
+        if (-not (Test-Path -Path $Path)) {
+            throw ("Role mapping file not found: {0}. Copy config/role-mappings.json.example and fill it in." -f $Path)
+        }
+        $Mappings = Get-Content -Path $Path -Raw -Encoding utf8 | ConvertFrom-Json -Depth 10 -AsHashtable
     }
-    $mappings = Get-Content -Path $Path -Raw -Encoding utf8 | ConvertFrom-Json -Depth 10 -AsHashtable
 
-    if (-not $mappings.ContainsKey($Department)) {
+    if ($mappings -isnot [System.Collections.IDictionary]) {
+        throw 'Role mapping validation failed: the root must be an object.'
+    }
+    if (-not $mappings.Contains($Department)) {
         $valid = ($mappings.Keys | Sort-Object) -join ', '
         throw ("Unknown department '{0}'. Valid departments: {1}." -f $Department, $valid)
     }
     $mapping = $mappings[$Department]
+    if ($mapping -isnot [System.Collections.IDictionary]) {
+        throw ("Role mapping validation failed: department '{0}' must be an object." -f $Department)
+    }
     foreach ($field in @('groups', 'licenses')) {
-        if ($null -eq $mapping[$field]) { $mapping[$field] = @() }
+        if (-not $mapping.Contains($field) -or $mapping[$field] -isnot [array]) {
+            throw ("Role mapping validation failed: department '{0}' requires an explicit '{1}' array; use [] for intentionally empty access." -f $Department, $field)
+        }
     }
     foreach ($g in $mapping['groups']) {
-        $isLegacy = $g -is [string]
-        $hasId = -not $isLegacy -and -not [string]::IsNullOrWhiteSpace($g['id'])
-        $hasName = -not $isLegacy -and -not [string]::IsNullOrWhiteSpace($g['name'])
-        if ($isLegacy -or -not $hasId -or -not $hasName) {
+        $isObject = $g -is [System.Collections.IDictionary]
+        $hasId = $isObject -and $g['id'] -is [string] -and -not [string]::IsNullOrWhiteSpace($g['id'])
+        $hasName = $isObject -and $g['name'] -is [string] -and -not [string]::IsNullOrWhiteSpace($g['name'])
+        $groupGuid = [guid]::Empty
+        if (-not $hasId -or -not $hasName -or
+            -not [guid]::TryParseExact($g['id'], 'D', [ref]$groupGuid) -or $groupGuid -eq [guid]::Empty) {
             throw ("Role mapping validation failed: department '{0}': every group must be an object with 'id' and 'name' (Entra object ID, not display name). " -f $Department +
                 "Look up IDs with: Get-MgGroup -Filter ""displayName eq 'sg-name'"" | Select-Object Id, DisplayName")
+        }
+    }
+    foreach ($license in $mapping['licenses']) {
+        if ($license -isnot [string] -or [string]::IsNullOrWhiteSpace($license)) {
+            throw ("Role mapping validation failed: department '{0}' licenses must contain nonempty SKU strings." -f $Department)
         }
     }
     return $mapping
@@ -352,17 +394,80 @@ function Get-ManagedGroupUniverse {
     param(
         [Parameter(Mandatory)][string]$Path
     )
-    $mappings = Get-Content -Path $Path -Raw -Encoding utf8 | ConvertFrom-Json -Depth 10 -AsHashtable
-    $universe = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($dept in $mappings.Keys | Where-Object { -not $_.StartsWith('_') }) {
-        # Reuses Get-RoleMapping so the group shape is validated here too.
-        $mapping = Get-RoleMapping -Path $Path -Department $dept
-        foreach ($g in $mapping['groups']) { [void]$universe.Add($g['id']) }
-    }
+    $access = Get-ManagedAccessUniverse -Path $Path
     # Unary comma: without it PowerShell unrolls a one-element array on output
     # and callers receive a bare string (whose .Count is not 1) instead of an
     # array. The contract is "array of IDs", including the empty case.
-    return ,@($universe)
+    return ,@($access.GroupIds)
+}
+
+function Get-ManagedAccessUniverse {
+    <#
+    .SYNOPSIS
+        Builds both removal universes from one validated policy snapshot.
+        Underscore-prefixed metadata is never access policy.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $mappings = Get-Content -Path $Path -Raw -Encoding utf8 | ConvertFrom-Json -Depth 10 -AsHashtable
+    if ($mappings -isnot [System.Collections.IDictionary]) {
+        throw 'Role mapping validation failed: the root must be an object.'
+    }
+    $groups = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $licenses = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $roles = $mappings
+    foreach ($metadata in @($roles.Keys | Where-Object { $_.StartsWith('_') })) { $roles.Remove($metadata) }
+    foreach ($dept in $roles.Keys) {
+        $mapping = Get-RoleMapping -Path $Path -Department $dept -Mappings $mappings
+        foreach ($group in $mapping['groups']) { [void]$groups.Add($group['id']) }
+        foreach ($license in $mapping['licenses']) { [void]$licenses.Add($license) }
+    }
+    return [pscustomobject]@{ RoleMappings = $roles; GroupIds = @($groups); Licenses = @($licenses) }
+}
+
+function Enter-LifecycleUserLock {
+    <#
+    .SYNOPSIS
+        Excludes cooperating live mover/leaver runs for one tenant/user on
+        this host. Contention and abandoned ownership require reconciliation.
+        This is not a distributed lock or a Graph authorization boundary.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][guid]$TenantId,
+        [Parameter(Mandatory)][guid]$UserId
+    )
+    if ($TenantId -eq [guid]::Empty -or $UserId -eq [guid]::Empty) {
+        throw 'A user lock requires nonzero tenant and user object IDs.'
+    }
+    $name = 'JML-{0}-{1}' -f $TenantId.ToString('D'), $UserId.ToString('D')
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $name = 'Global\' + $name }
+    $mutex = [System.Threading.Mutex]::new($false, $name)
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # WaitOne grants ownership when abandonment is reported.
+            $mutex.ReleaseMutex()
+            throw 'Previous lifecycle run abandoned the user lock. Reconcile the audit and tenant state before retrying.'
+        }
+        if (-not $acquired) {
+            throw 'Another lifecycle run holds the user lock. Wait for it to finish and reconcile state before retrying.'
+        }
+        return $mutex
+    }
+    catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-LifecycleUserLock {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Threading.Mutex]$Lock)
+    try { $Lock.ReleaseMutex() }
+    finally { $Lock.Dispose() }
 }
 
 function Assert-ChangeTicket {
@@ -508,11 +613,14 @@ Export-ModuleMember -Function @(
     'Register-LifecycleStepFailure',
     'ConvertTo-GraphFilterLiteral',
     'Assert-ChangeTicket',
+    'Enter-LifecycleUserLock',
+    'Exit-LifecycleUserLock',
     'Connect-LifecycleGraph',
     'Disconnect-LifecycleGraph',
     'Get-LifecycleConfig',
     'Get-RoleMapping',
     'Get-ManagedGroupUniverse',
+    'Get-ManagedAccessUniverse',
     'Assert-LeaverForceAuthorization',
     'Assert-TenantSize',
     'Compare-MembershipPlan',

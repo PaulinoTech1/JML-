@@ -108,6 +108,7 @@ if ($IncludeDevices.IsPresent) {
 
 if ($Apply.IsPresent -and -not $Force.IsPresent) {
     $expected = "DISABLE $UserPrincipalName"
+    Write-Host ("Configured tenant: {0}" -f $config.tenantId) -ForegroundColor Cyan
     Write-Host ("Type '{0}' to confirm offboarding. Anything else aborts." -f $expected) -ForegroundColor Red
     $answer = Read-Host 'Confirm'
     if ($answer -ne $expected) {
@@ -117,11 +118,18 @@ if ($Apply.IsPresent -and -not $Force.IsPresent) {
     }
 }
 
+$userLock = $null
 try {
-    if ($Interactive) { Connect-LifecycleGraph -Interactive -Scopes $leaverScopes } else { Connect-LifecycleGraph -Scopes $leaverScopes }
+    if ($Interactive) { Connect-LifecycleGraph -TenantId $config.tenantId -Interactive -Scopes $leaverScopes } else { Connect-LifecycleGraph -TenantId $config.tenantId -Scopes $leaverScopes }
 
-    $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $UserPrincipalName)) -ErrorAction Stop
-    if (-not $user) { throw "User '$UserPrincipalName' not found." }
+    $userMatches = @(Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $UserPrincipalName)) -Property 'id,accountEnabled' -ErrorAction Stop)
+    if ($userMatches.Count -ne 1) { throw "Expected exactly one user for '$UserPrincipalName'; found $($userMatches.Count)." }
+    $user = $userMatches[0]
+    if ($Apply.IsPresent) {
+        $userLock = Enter-LifecycleUserLock -TenantId $config.tenantId -UserId $user.Id
+        # Do not base live decisions on a read made before ownership.
+        $user = Get-MgUser -UserId $user.Id -Property 'id,accountEnabled' -ErrorAction Stop
+    }
 
     # --- 1. Revoke sessions FIRST: kill active access before anything else ---
     Invoke-LifecycleStep -Action 'User.RevokeSessions' -Target $UserPrincipalName `
@@ -130,7 +138,9 @@ try {
         } | Out-Null
 
     # --- 2. Disable the account ---
-    if ($user.AccountEnabled) {
+    # Only an explicit Boolean false proves that disabling is unnecessary.
+    if ($null -eq $user.PSObject.Properties['AccountEnabled'] -or
+        $user.AccountEnabled -isnot [bool] -or $user.AccountEnabled) {
         Invoke-LifecycleStep -Action 'User.Disable' -Target $UserPrincipalName -ScriptBlock {
             Update-MgUser -UserId $user.Id -AccountEnabled:$false
         } | Out-Null
@@ -152,7 +162,7 @@ try {
     }
 
     # --- 4. Remove all licenses ---
-    $licenseDetails = Get-MgUserLicenseDetail -UserId $user.Id -ErrorAction Stop
+    $licenseDetails = @(Get-MgUserLicenseDetail -UserId $user.Id -ErrorAction Stop)
     if ($licenseDetails.Count -gt 0) {
         $skuIds = @($licenseDetails | ForEach-Object { $_.SkuId })
         Invoke-LifecycleStep -Action 'License.RemoveAll' -Target $UserPrincipalName `
@@ -195,11 +205,13 @@ try {
     # failure here must not mask the audit trail. Any mismatch needs
     # operator review, not an automatic retry.
     if ($Apply.IsPresent) {
-        $recheck = Get-MgUser -UserId $user.Id -ErrorAction Stop
+        $recheck = Get-MgUser -UserId $user.Id -Property 'id,accountEnabled' -ErrorAction Stop
         $remainingGroups = @(Get-MgUserMemberOf -UserId $user.Id -All -ErrorAction Stop |
             Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.group' })
-        $verifyDetail = ("accountEnabled={0} remainingDirectGroups={1}" -f $recheck.AccountEnabled, $remainingGroups.Count)
-        if ($recheck.AccountEnabled -or $remainingGroups.Count -gt 0) {
+        $knownState = $null -ne $recheck -and $null -ne $recheck.PSObject.Properties['AccountEnabled'] -and $recheck.AccountEnabled -is [bool]
+        $enabledState = if ($knownState) { $recheck.AccountEnabled } else { 'unknown' }
+        $verifyDetail = ("accountEnabled={0} remainingDirectGroups={1}" -f $enabledState, $remainingGroups.Count)
+        if (-not $knownState -or $enabledState -ne $false -or $remainingGroups.Count -gt 0) {
             Write-Warning ("Post-apply verification FAILED: {0}. Review the audit log; the tenant may need reconciliation." -f $verifyDetail)
             Write-LifecycleAudit -Action 'Verify.OffboardState' -Target $UserPrincipalName -Result 'Failed' -Detail $verifyDetail | Out-Null
         }
@@ -225,5 +237,6 @@ try {
     }
 }
 finally {
-    Disconnect-LifecycleGraph
+    try { Disconnect-LifecycleGraph }
+    finally { if ($null -ne $userLock) { Exit-LifecycleUserLock -Lock $userLock } }
 }

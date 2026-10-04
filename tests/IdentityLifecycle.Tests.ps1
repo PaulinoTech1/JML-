@@ -73,14 +73,14 @@ Describe 'New-LifecycleUpn' {
 Describe 'Get-LifecycleConfig' {
     It 'loads a valid config' {
         $path = Join-Path $testRoot 'config.json'
-        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
+        '{"tenantId":"11111111-1111-1111-1111-111111111111","domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
         $config = Get-LifecycleConfig -Path $path
         $config.domain | Should -Be 'contoso.com'
     }
 
     It 'fails closed when a required field is missing' {
         $path = Join-Path $testRoot 'bad-config.json'
-        '{"domain":"contoso.com","upnPattern":"{first}.{last}"}' | Set-Content -Path $path -Encoding utf8
+        '{"tenantId":"11111111-1111-1111-1111-111111111111","domain":"contoso.com","upnPattern":"{first}.{last}"}' | Set-Content -Path $path -Encoding utf8
         { Get-LifecycleConfig -Path $path } | Should -Throw '*usageLocation*'
     }
 
@@ -90,14 +90,14 @@ Describe 'Get-LifecycleConfig' {
 
     It 'defaults maxTenantUsers to 1000 when absent' {
         $path = Join-Path $testRoot 'config-notenant.json'
-        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
+        '{"tenantId":"11111111-1111-1111-1111-111111111111","domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
         $config = Get-LifecycleConfig -Path $path
         $config.maxTenantUsers | Should -Be 1000
     }
 
     It 'rejects a non-positive maxTenantUsers' {
         $path = Join-Path $testRoot 'config-badtenant.json'
-        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","maxTenantUsers":0}' | Set-Content -Path $path -Encoding utf8
+        '{"tenantId":"11111111-1111-1111-1111-111111111111","domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","maxTenantUsers":0}' | Set-Content -Path $path -Encoding utf8
         { Get-LifecycleConfig -Path $path } | Should -Throw '*maxTenantUsers*'
     }
 }
@@ -249,21 +249,21 @@ Describe 'Assert-LeaverForceAuthorization ticket pattern' {
 Describe 'Get-LifecycleConfig changeTicketPattern' {
     It 'defaults changeTicketPattern to empty when absent' {
         $path = Join-Path $testRoot 'config-nopattern.json'
-        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
+        '{"tenantId":"11111111-1111-1111-1111-111111111111","domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US"}' | Set-Content -Path $path -Encoding utf8
         $config = Get-LifecycleConfig -Path $path
         $config.changeTicketPattern | Should -Be ''
     }
 
     It 'accepts a valid changeTicketPattern regex' {
         $path = Join-Path $testRoot 'config-pattern.json'
-        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","changeTicketPattern":"^CHG-[0-9]+$"}' | Set-Content -Path $path -Encoding utf8
+        '{"tenantId":"11111111-1111-1111-1111-111111111111","domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","changeTicketPattern":"^CHG-[0-9]+$"}' | Set-Content -Path $path -Encoding utf8
         $config = Get-LifecycleConfig -Path $path
         $config.changeTicketPattern | Should -Be '^CHG-[0-9]+$'
     }
 
     It 'rejects an invalid changeTicketPattern regex at load time' {
         $path = Join-Path $testRoot 'config-badpattern.json'
-        '{"domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","changeTicketPattern":"([unclosed"}' | Set-Content -Path $path -Encoding utf8
+        '{"tenantId":"11111111-1111-1111-1111-111111111111","domain":"contoso.com","upnPattern":"{first}.{last}","usageLocation":"US","changeTicketPattern":"([unclosed"}' | Set-Content -Path $path -Encoding utf8
         { Get-LifecycleConfig -Path $path } | Should -Throw '*changeTicketPattern*'
     }
 }

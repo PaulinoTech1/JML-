@@ -12,6 +12,8 @@ How to run identity lifecycle automation in production. Written for the admin wh
 4. Look up group object IDs for the role mappings: `Get-MgGroup | Select-Object Id, DisplayName`. Groups are referenced by immutable ID, never display name.
 5. Run every script once with `-Interactive` and **without** `-Apply` against a test user. Read the audit log. Confirm the plan matches your intent.
 6. Note the tenant-size boundary: this tool is sized for tenants up to `maxTenantUsers` (default 1,000). The access review fails closed above it.
+7. Set a real, nonzero `tenantId` in lifecycle config. If `LIFECYCLE_TENANT_ID` is present, it must agree. Each entry point verifies the authenticated Graph tenant. Use a separate PowerShell process for each lifecycle run.
+8. Role mappings must contain explicit `groups` and `licenses` arrays. Use `[]` only when empty access is intended; omitted/null fields are rejected. See [the security corrections and their rationale](SECURITY_FIXES.md).
 
 ## Joiner (new hire)
 
@@ -47,6 +49,7 @@ How to run identity lifecycle automation in production. Written for the admin wh
    ```
 6. **Mobile devices (optional, gated):** by default the scripts never wipe devices. If your process calls for it (e.g. lost or stolen devices), add `-IncludeDevices` to the leaver run: it wipes the user's Intune-enrolled devices, but it **requires `-ChangeTicket`** with the approved change record reference in every mode, including interactive runs, and the authorization is written to the audit log. A wipe issued against the wrong account is unrecoverable, so never add the flag by habit; confirm the UPN and the ticket first. The app registration also needs the `DeviceManagementManagedDevices.PrivilegedOperations.All` permission (see `docs/APP_REGISTRATION.md`) or the wipe step fails closed.
 7. File the audit log path in the termination ticket.
+8. Live mover and leaver runs for the same tenant/user are mutually exclusive on the same host. A conflicting run stops instead of waiting or retrying. After the active run completes, review its audit and tenant state before retrying. This does not coordinate separate hosts or external Graph clients, and a later mover can still regrant access. Do not automatically retry device wipes.
 
 ## Quarterly access review
 
@@ -60,7 +63,7 @@ How to run identity lifecycle automation in production. Written for the admin wh
 
 ## Recovering from a partial failure
 
-Steps run sequentially, and there is no automatic rollback: a failed group add does not undo the account creation that preceded it, and rolling back a half-finished offboarding could re-enable an account that must stay disabled. The run prints a failed-step count at the end and writes a `Run.PartialFailure` audit record. Reconcile like this:
+Steps run sequentially, and there is no automatic rollback: a failed group add does not undo the account creation that preceded it, and rolling back a half-finished offboarding could re-enable an account that must stay disabled. A terminating error may stop the script before its final failed-step summary or `Run.PartialFailure` record; inspect the per-step audit even if no `Done` message appears. Reconcile like this:
 
 1. Open the run's JSONL audit log (the path is printed at the end of the run).
 2. Find every entry with `"result":"Failed"`; each carries the Graph error message in `detail`.

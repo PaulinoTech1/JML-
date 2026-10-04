@@ -33,4 +33,4 @@ jobs:
           $config.Run.PassThru = $true
           $config.Output.Verbosity = 'Detailed'
           $result = Invoke-Pester -Configuration $config
-          if ($result.FailedCount -gt 0 -or $result.InconclusiveCount -gt 0) { exit 1 }
+          if ($result.FailedCount -gt 0 -or $result.FailedContainers.Count -gt 0 -or $result.NotRunCount -gt 0 -or $result.TotalCount -eq 0) { exit 1 }

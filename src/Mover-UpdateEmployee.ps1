@@ -51,15 +51,21 @@ Set-LifecycleMode -Apply $Apply.IsPresent
 $run = Initialize-LifecycleRun -ScriptName 'Mover-UpdateEmployee' -LogDirectory $LogDirectory
 Write-Host ("Run {0} | dryRun={1} | audit: {2}" -f $run.RunId, $run.DryRun, $run.AuditLogPath) -ForegroundColor Cyan
 
+$userLock = $null
 try {
-    if ($Interactive) { Connect-LifecycleGraph -Interactive -Scopes $moverScopes } else { Connect-LifecycleGraph -Scopes $moverScopes }
-
-    $null = Get-LifecycleConfig -Path $ConfigPath  # validated; fail-closed on bad config
-    $mapping = Get-RoleMapping -Path $RoleMapPath -Department $NewDepartment
-    $managedUniverse = Get-ManagedGroupUniverse -Path $RoleMapPath
+    $config = Get-LifecycleConfig -Path $ConfigPath
+    $access = Get-ManagedAccessUniverse -Path $RoleMapPath
+    $mapping = Get-RoleMapping -Path $RoleMapPath -Department $NewDepartment -Mappings $access.RoleMappings
+    $managedUniverse = $access.GroupIds
+    $allManagedLicenses = $access.Licenses
+    if ($Interactive) { Connect-LifecycleGraph -TenantId $config.tenantId -Interactive -Scopes $moverScopes } else { Connect-LifecycleGraph -TenantId $config.tenantId -Scopes $moverScopes }
 
     $user = Get-MgUser -Filter ("userPrincipalName eq '{0}'" -f (ConvertTo-GraphFilterLiteral $UserPrincipalName)) -ErrorAction Stop
     if (-not $user) { throw "User '$UserPrincipalName' not found." }
+    if ($Apply.IsPresent) {
+        $userLock = Enter-LifecycleUserLock -TenantId $config.tenantId -UserId $user.Id
+        $user = Get-MgUser -UserId $user.Id -ErrorAction Stop
+    }
 
     # --- Group reconciliation (by immutable object ID, never display name) ---
     $memberOf = Get-MgUserMemberOf -UserId $user.Id -All -ErrorAction Stop
@@ -103,10 +109,6 @@ try {
     foreach ($sku in $skus) { $partNumberOf[$sku.SkuId] = $sku.SkuPartNumber }
     $currentLicenses = @($licenseDetails | ForEach-Object { $partNumberOf[$_.SkuId] } | Where-Object { $_ })
 
-    $allManagedLicenses = @(
-        (Get-Content -Path $RoleMapPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 10 -AsHashtable).Values |
-            ForEach-Object { $_['licenses'] } | Select-Object -Unique
-    )
     $licensePlan = Compare-MembershipPlan -Current $currentLicenses -Target $mapping['licenses'] -ManagedUniverse $allManagedLicenses
     Write-Host ("Licenses: +{0} add, -{1} remove, ={2} keep" -f $licensePlan.Add.Count, $licensePlan.Remove.Count, $licensePlan.Keep.Count)
 
@@ -204,5 +206,6 @@ try {
     }
 }
 finally {
-    Disconnect-LifecycleGraph
+    try { Disconnect-LifecycleGraph }
+    finally { if ($null -ne $userLock) { Exit-LifecycleUserLock -Lock $userLock } }
 }

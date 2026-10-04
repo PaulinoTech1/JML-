@@ -55,10 +55,9 @@ $run = Initialize-LifecycleRun -ScriptName 'Joiner-NewEmployee' -LogDirectory $L
 Write-Host ("Run {0} | dryRun={1} | audit: {2}" -f $run.RunId, $run.DryRun, $run.AuditLogPath) -ForegroundColor Cyan
 
 try {
-    if ($Interactive) { Connect-LifecycleGraph -Interactive -Scopes $joinerScopes } else { Connect-LifecycleGraph -Scopes $joinerScopes }
-
     $config  = Get-LifecycleConfig -Path $ConfigPath
     $mapping = Get-RoleMapping -Path $RoleMapPath -Department $Department
+    if ($Interactive) { Connect-LifecycleGraph -TenantId $config.tenantId -Interactive -Scopes $joinerScopes } else { Connect-LifecycleGraph -TenantId $config.tenantId -Scopes $joinerScopes }
 
     $upn = New-LifecycleUpn -FirstName $FirstName -LastName $LastName -Pattern $config.upnPattern -Domain $config.domain
     Write-Host "Target UPN: $upn"

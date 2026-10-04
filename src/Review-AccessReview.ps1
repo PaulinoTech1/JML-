@@ -44,13 +44,13 @@ if (-not (Test-Path -Path $ReportDirectory)) { New-Item -ItemType Directory -Pat
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 try {
+    $config = Get-LifecycleConfig -Path $ConfigPath
     if ($Interactive) {
-        Connect-LifecycleGraph -Interactive -Scopes @('User.Read.All', 'Directory.Read.All', 'RoleManagement.Read.Directory', 'AuditLog.Read.All')
+        Connect-LifecycleGraph -TenantId $config.tenantId -Interactive -Scopes @('User.Read.All', 'Directory.Read.All', 'RoleManagement.Read.Directory', 'AuditLog.Read.All')
     }
     else {
-        Connect-LifecycleGraph -Scopes @('User.Read.All', 'Directory.Read.All', 'RoleManagement.Read.Directory', 'AuditLog.Read.All')
+        Connect-LifecycleGraph -TenantId $config.tenantId -Scopes @('User.Read.All', 'Directory.Read.All', 'RoleManagement.Read.Directory', 'AuditLog.Read.All')
     }
-    $config = Get-LifecycleConfig -Path $ConfigPath  # validated; fail-closed on bad config
 
     $cutoff = (Get-Date).AddDays(-$StaleDays)
 
