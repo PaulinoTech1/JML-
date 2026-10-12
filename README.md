@@ -1,5 +1,9 @@
 # Identity Lifecycle Automation (Joiner / Mover / Leaver)
 
+## TL;DR
+
+Joiner/mover/leaver identity lifecycle automation in PowerShell + Microsoft Graph. Dry-run by default, a single mutation choke point, and a JSONL audit trail. Goal: safe, auditable employee onboarding and offboarding for Microsoft 365 tenants.
+
 PowerShell automation for employee identity lifecycle management in Microsoft Entra ID, built for small businesses: disciplined joiner/mover/leaver automation for the shop where IT is one person wearing five hats. Sized for tenants up to 1,000 users; it fails closed above that instead of pretending to scale.
 
 ## What this is
